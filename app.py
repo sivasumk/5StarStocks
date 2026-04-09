@@ -1,33 +1,25 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-import requests
-from io import StringIO
+from pathlib import Path
 from datetime import datetime
 
 st.set_page_config(page_title="5-Star Stocks Scanner", layout="wide")
 
-# ─── Nifty 500 stock list ───────────────────────────────────────
-@st.cache_data(ttl=86400)
+BASE_DIR = Path(__file__).parent
+
+# ─── Nifty 500 stock list (static CSV) ─────────────────────────
+@st.cache_data
 def fetch_nifty500():
-    url = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers, timeout=15)
-    r.raise_for_status()
-    df = pd.read_csv(StringIO(r.text))
-    # Column is usually "Symbol"
-    col = [c for c in df.columns if "symbol" in c.lower()][0]
-    symbols = df[col].str.strip().tolist()
-    return symbols
+    df = pd.read_csv(BASE_DIR / "nifty500.csv")
+    return df["Symbol"].str.strip().tolist()
 
 
-# ─── F&O stock list ────────────────────────────────────────────
-@st.cache_data(ttl=86400)
+# ─── F&O stock list (static CSV) ───────────────────────────────
+@st.cache_data
 def fetch_fno_stocks():
-    url = "https://api.kite.trade/instruments/NFO"
-    df = pd.read_csv(url)
-    fno = df[df["instrument_type"] == "FUT"]["name"].unique().tolist()
-    return set(fno)
+    df = pd.read_csv(BASE_DIR / "fno_stocks.csv")
+    return set(df["Symbol"].str.strip().tolist())
 
 
 # ─── Download OHLCV ─────────────────────────────────────────────
