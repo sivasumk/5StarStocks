@@ -252,6 +252,13 @@ def analyse_all(data, symbols, index_data):
         # ── Compute indicators on full series ──
         rsi = compute_rsi(close)
         smi, smi_sig = compute_smi(high, low, close)
+
+        # SMI signal-line crossovers
+        smi_above = (smi > smi_sig).astype(bool)
+        smi_prev = smi_above.shift(1, fill_value=False)
+        cross_up = smi_above & ~smi_prev          # bullish crossover
+        cross_down = ~smi_above & smi_prev        # bearish crossover
+
         obv = compute_obv(close, vol)
         atr = compute_atr(high, low, close)
         adx, plus_di, minus_di = compute_adx(high, low, close)
@@ -448,6 +455,23 @@ def analyse_all(data, symbols, index_data):
         above_ema = cur["close"] > cur["ema34"]
         ema_status = "Above" if above_ema else "Below"
 
+        # SMI crossover: find most recent within last 10 bars
+        cross_lookback = min(10, len(smi))
+        cross_label = "—"
+        cross_bars_ago = None
+        for i in range(1, cross_lookback + 1):
+            idx = -i
+            if cross_up.iloc[idx]:
+                cross_label = f"▲ Bull ({i-1}d)" if i > 1 else "▲ Bull (today)"
+                cross_bars_ago = i - 1
+                break
+            if cross_down.iloc[idx]:
+                cross_label = f"▼ Bear ({i-1}d)" if i > 1 else "▼ Bear (today)"
+                cross_bars_ago = -(i - 1) - 1  # negative indicates bearish
+                break
+        # Direction of current SMI vs signal (for colour)
+        smi_vs_sig = "Above" if smi.iloc[-1] > smi_sig.iloc[-1] else "Below"
+
         # ── Trade signal: score + indicator confluence ──
         # Strong Long  — momentum score ≥ 60 AND price above EMA34 AND RSI ≥ 55
         # Long         — momentum score ≥ 25 AND price above EMA34
@@ -481,6 +505,8 @@ def analyse_all(data, symbols, index_data):
             "SMI": round(smi_val, 1),
             "SMI Sig": round(cur["smi_sig"], 1),
             "SMI Zone": smi_zone,
+            "SMI Cross": cross_label,
+            "SMI vs Sig": smi_vs_sig,
             "SMI Trend": trend_smi_vals,
             "SMI Dir": trend_dir(trend_smi_vals),
 
@@ -569,6 +595,16 @@ def color_signal(val):
     }.get(val, "")
 
 
+def color_smi_cross(val):
+    """Color-code SMI crossover labels."""
+    if isinstance(val, str):
+        if val.startswith("▲"):
+            return "background-color: #198754; color: white; font-weight: bold"
+        if val.startswith("▼"):
+            return "background-color: #dc3545; color: white; font-weight: bold"
+    return "color: #888888"
+
+
 def color_trend_dir(val):
     if val == "↑":
         return "color: #00cc44; font-weight: bold; font-size: 1.2em"
@@ -593,6 +629,11 @@ def main():
             "Trade Signal",
             ["Strong Long", "Long", "Neutral", "Short", "Strong Short"],
             default=[],
+        )
+        smi_cross_filter = st.radio(
+            "SMI Crossover",
+            ["All", "Recent Bull Cross (≤3d)", "Recent Bear Cross (≤3d)"],
+            index=0,
         )
         zone_filter = st.multiselect(
             "RSI Zone",
@@ -659,6 +700,32 @@ def main():
     filtered = result.copy()
     if signal_filter:
         filtered = filtered[filtered["Signal"].isin(signal_filter)]
+    if smi_cross_filter == "Recent Bull Cross (≤3d)":
+        mask = filtered["SMI Cross"].str.startswith("▲")
+        # Extract day count from label to enforce ≤3
+        def _recent_bull(lbl):
+            if not isinstance(lbl, str) or not lbl.startswith("▲"):
+                return False
+            if "today" in lbl:
+                return True
+            try:
+                days = int(lbl.split("(")[1].split("d")[0])
+                return days <= 3
+            except Exception:
+                return False
+        filtered = filtered[filtered["SMI Cross"].map(_recent_bull)]
+    elif smi_cross_filter == "Recent Bear Cross (≤3d)":
+        def _recent_bear(lbl):
+            if not isinstance(lbl, str) or not lbl.startswith("▼"):
+                return False
+            if "today" in lbl:
+                return True
+            try:
+                days = int(lbl.split("(")[1].split("d")[0])
+                return days <= 3
+            except Exception:
+                return False
+        filtered = filtered[filtered["SMI Cross"].map(_recent_bear)]
     if zone_filter:
         filtered = filtered[filtered["RSI Zone"].isin(zone_filter)]
     if ema_filter:
@@ -710,7 +777,7 @@ def main():
         compact_cols = [
             "Symbol", "Close", "Signal", "Score", "Score Dir",
             "RSI", "RSI Zone", "RSI Dir",
-            "SMI", "SMI Zone", "SMI Dir",
+            "SMI", "SMI Zone", "SMI Cross", "SMI Dir",
             "ADX", "ADX Str", "ADX Dir",
             "EMA Status", "EMA 5 Slope%", "EMA Dir",
             "RS Score", "RS Dir",
@@ -722,6 +789,7 @@ def main():
         styled = display_df.style.map(color_score, subset=["Score"]) \
             .map(color_rsi, subset=["RSI"]) \
             .map(color_signal, subset=["Signal"]) \
+            .map(color_smi_cross, subset=["SMI Cross"]) \
             .map(color_trend_dir, subset=["Score Dir", "RSI Dir", "SMI Dir", "ADX Dir", "EMA Dir", "RS Dir", "OBV Dir"])
 
         st.dataframe(styled, width="stretch", height=800)
@@ -734,7 +802,7 @@ def main():
         display_cols = [
             "Symbol", "Close", "Signal", "Score", "Score Trend", "Score Dir",
             "RSI", "RSI Zone", "RSI Trend", "RSI Dir",
-            "SMI", "SMI Sig", "SMI Zone", "SMI Trend", "SMI Dir",
+            "SMI", "SMI Sig", "SMI Zone", "SMI Cross", "SMI vs Sig", "SMI Trend", "SMI Dir",
             "ADX", "+DI", "-DI", "ADX Str", "ADX Trend", "ADX Dir",
             "EMA 34", "EMA Status", "EMA 5 Slope%", "EMA Score", "EMA Trend", "EMA Dir",
             "RS Score", "RS Trend", "RS Dir",
