@@ -448,9 +448,27 @@ def analyse_all(data, symbols, index_data):
         above_ema = cur["close"] > cur["ema34"]
         ema_status = "Above" if above_ema else "Below"
 
+        # ── Trade signal: score + indicator confluence ──
+        # Strong Long  — momentum score ≥ 60 AND price above EMA34 AND RSI ≥ 55
+        # Long         — momentum score ≥ 25 AND price above EMA34
+        # Strong Short — momentum score ≤ -60 AND price below EMA34 AND RSI ≤ 45
+        # Short        — momentum score ≤ -25 AND price below EMA34
+        # Neutral      — everything else
+        if momentum >= 60 and above_ema and rsi_val >= 55:
+            signal = "Strong Long"
+        elif momentum >= 25 and above_ema:
+            signal = "Long"
+        elif momentum <= -60 and not above_ema and rsi_val <= 45:
+            signal = "Strong Short"
+        elif momentum <= -25 and not above_ema:
+            signal = "Short"
+        else:
+            signal = "Neutral"
+
         rows.append({
             "Symbol": sym,
             "Close": round(float(cur["close"]), 2),
+            "Signal": signal,
             "Score": round(momentum, 1),
             "Score Trend": trend_scores,
             "Score Dir": trend_dir(trend_scores),
@@ -540,6 +558,17 @@ def color_rsi(val):
     return ""
 
 
+def color_signal(val):
+    """Color-code the trade signal."""
+    return {
+        "Strong Long":  "background-color: #0d6e3a; color: white; font-weight: bold",
+        "Long":         "background-color: #198754; color: white",
+        "Neutral":      "background-color: #6c757d; color: white",
+        "Short":        "background-color: #dc3545; color: white",
+        "Strong Short": "background-color: #8b0000; color: white; font-weight: bold",
+    }.get(val, "")
+
+
 def color_trend_dir(val):
     if val == "↑":
         return "color: #00cc44; font-weight: bold; font-size: 1.2em"
@@ -560,6 +589,11 @@ def main():
 
         st.markdown("---")
         st.subheader("Filters")
+        signal_filter = st.multiselect(
+            "Trade Signal",
+            ["Strong Long", "Long", "Neutral", "Short", "Strong Short"],
+            default=[],
+        )
         zone_filter = st.multiselect(
             "RSI Zone",
             ["Strong Bull", "Bullish", "Neutral", "Bearish", "Strong Bear"],
@@ -623,6 +657,8 @@ def main():
 
     # ── Apply filters ──
     filtered = result.copy()
+    if signal_filter:
+        filtered = filtered[filtered["Signal"].isin(signal_filter)]
     if zone_filter:
         filtered = filtered[filtered["RSI Zone"].isin(zone_filter)]
     if ema_filter:
@@ -635,23 +671,34 @@ def main():
         (filtered["Score"] >= score_range[0]) & (filtered["Score"] <= score_range[1])
     ]
 
+    # ── Signal counts ──
+    sig_counts = result["Signal"].value_counts()
+    n_sl = int(sig_counts.get("Strong Long", 0))
+    n_l  = int(sig_counts.get("Long", 0))
+    n_n  = int(sig_counts.get("Neutral", 0))
+    n_s  = int(sig_counts.get("Short", 0))
+    n_ss = int(sig_counts.get("Strong Short", 0))
+    n_long = n_sl + n_l
+    n_short = n_ss + n_s
+
     # ── Summary metrics ──
     st.sidebar.markdown("---")
-    n_bull = len(result[result["Score"] > 20])
-    n_bear = len(result[result["Score"] < -20])
-    n_neutral = len(result) - n_bull - n_bear
-    st.sidebar.metric("Bullish (>20)", n_bull)
-    st.sidebar.metric("Neutral", n_neutral)
-    st.sidebar.metric("Bearish (<-20)", n_bear)
+    st.sidebar.subheader("Trade Signals")
+    st.sidebar.metric("Strong Long", n_sl)
+    st.sidebar.metric("Long", n_l)
+    st.sidebar.metric("Neutral", n_n)
+    st.sidebar.metric("Short", n_s)
+    st.sidebar.metric("Strong Short", n_ss)
     avg_score = result["Score"].mean()
     st.sidebar.metric("Avg Score", f"{avg_score:.1f}")
     st.sidebar.caption(f"Last scan: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
     # ── Market breadth bar ──
-    col_b1, col_b2, col_b3 = st.columns(3)
-    col_b1.metric("Bullish Stocks", f"{n_bull} / {len(result)}", delta=f"{n_bull/len(result)*100:.0f}%")
-    col_b2.metric("Average Momentum", f"{avg_score:.1f}", delta="Bullish" if avg_score > 10 else ("Bearish" if avg_score < -10 else "Neutral"))
-    col_b3.metric("Showing", f"{len(filtered)} / {len(result)}", delta="filtered" if len(filtered) < len(result) else "all")
+    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+    col_b1.metric("Long Signals", f"{n_long}", delta=f"{n_sl} strong")
+    col_b2.metric("Short Signals", f"{n_short}", delta=f"{n_ss} strong", delta_color="inverse")
+    col_b3.metric("Average Momentum", f"{avg_score:.1f}", delta="Bullish" if avg_score > 10 else ("Bearish" if avg_score < -10 else "Neutral"))
+    col_b4.metric("Showing", f"{len(filtered)} / {len(result)}", delta="filtered" if len(filtered) < len(result) else "all")
 
     st.markdown("---")
 
@@ -661,7 +708,7 @@ def main():
     if view == "Compact Ranking":
         # Compact: just symbol, score, key indicators, trend arrows
         compact_cols = [
-            "Symbol", "Close", "Score", "Score Dir",
+            "Symbol", "Close", "Signal", "Score", "Score Dir",
             "RSI", "RSI Zone", "RSI Dir",
             "SMI", "SMI Zone", "SMI Dir",
             "ADX", "ADX Str", "ADX Dir",
@@ -674,6 +721,7 @@ def main():
 
         styled = display_df.style.map(color_score, subset=["Score"]) \
             .map(color_rsi, subset=["RSI"]) \
+            .map(color_signal, subset=["Signal"]) \
             .map(color_trend_dir, subset=["Score Dir", "RSI Dir", "SMI Dir", "ADX Dir", "EMA Dir", "RS Dir", "OBV Dir"])
 
         st.dataframe(styled, width="stretch", height=800)
@@ -684,7 +732,7 @@ def main():
 
         # Configure columns for st.dataframe with sparkline charts
         display_cols = [
-            "Symbol", "Close", "Score", "Score Trend", "Score Dir",
+            "Symbol", "Close", "Signal", "Score", "Score Trend", "Score Dir",
             "RSI", "RSI Zone", "RSI Trend", "RSI Dir",
             "SMI", "SMI Sig", "SMI Zone", "SMI Trend", "SMI Dir",
             "ADX", "+DI", "-DI", "ADX Str", "ADX Trend", "ADX Dir",
@@ -741,18 +789,29 @@ def main():
             height=900,
         )
 
-    # ── Top / Bottom 10 ──
+    # ── Long / Short trade candidates ──
     st.markdown("---")
+    summary_cols = ["Symbol", "Close", "Signal", "Score", "RSI Zone", "SMI Zone", "ADX Str", "EMA Status", "ATR State"]
+
+    long_trades = result[result["Signal"].isin(["Strong Long", "Long"])].head(15)
+    short_trades = result[result["Signal"].isin(["Strong Short", "Short"])].sort_values("Score").head(15)
+
     col_t, col_bo = st.columns(2)
     with col_t:
-        st.subheader("Top 10 Momentum", divider="green")
-        top10 = result.head(10)[["Symbol", "Close", "Score", "RSI Zone", "SMI Zone", "ADX Str", "EMA Status", "ATR State"]].copy()
-        st.dataframe(top10, width="stretch", hide_index=True)
+        st.subheader(f"Long Trade Candidates ({len(long_trades)})", divider="green")
+        if long_trades.empty:
+            st.info("No long signals.")
+        else:
+            styled_long = long_trades[summary_cols].style.map(color_signal, subset=["Signal"]).map(color_score, subset=["Score"])
+            st.dataframe(styled_long, width="stretch", hide_index=True)
 
     with col_bo:
-        st.subheader("Bottom 10 Momentum", divider="red")
-        bot10 = result.tail(10)[["Symbol", "Close", "Score", "RSI Zone", "SMI Zone", "ADX Str", "EMA Status", "ATR State"]].copy()
-        st.dataframe(bot10, width="stretch", hide_index=True)
+        st.subheader(f"Short Trade Candidates ({len(short_trades)})", divider="red")
+        if short_trades.empty:
+            st.info("No short signals.")
+        else:
+            styled_short = short_trades[summary_cols].style.map(color_signal, subset=["Signal"]).map(color_score, subset=["Score"])
+            st.dataframe(styled_short, width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":
