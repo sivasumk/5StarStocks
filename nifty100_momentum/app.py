@@ -4,7 +4,10 @@ import numpy as np
 import yfinance as yf
 import requests
 from io import StringIO
+from pathlib import Path
 from datetime import datetime
+
+BASE_DIR = Path(__file__).parent
 
 st.set_page_config(
     page_title="Nifty 100 Momentum Dashboard",
@@ -34,19 +37,30 @@ TREND_DAYS = 7   # number of trading days for trend computation
 
 @st.cache_data(ttl=86400)
 def fetch_nifty100_symbols():
-    """Fetch Nifty 100 constituents from NSE India website."""
+    """Load Nifty 100 constituents.
+
+    Tries the live niftyindices.com CSV first; falls back to the bundled
+    static CSV if the fetch fails (needed on hosts that block outbound
+    requests to niftyindices.com, e.g. Streamlit Community Cloud).
+    """
     url = "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "text/csv,text/plain,*/*",
         "Referer": "https://www.niftyindices.com/",
     }
-    resp = requests.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    df = pd.read_csv(StringIO(resp.text))
+    source = "static CSV"
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text))
+        source = "niftyindices.com (live)"
+    except Exception:
+        df = pd.read_csv(BASE_DIR / "nifty100.csv")
+
     sym_col = [c for c in df.columns if "symbol" in c.lower()][0]
     symbols = df[sym_col].str.strip().tolist()
-    return sorted(symbols)
+    return sorted(symbols), source
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -575,15 +589,15 @@ def main():
             st.text(f"{k.upper():>5s}: {v:.0%}")
 
     # ── Fetch data ──
-    with st.spinner("Fetching Nifty 100 list from niftyindices.com..."):
+    with st.spinner("Loading Nifty 100 list..."):
         try:
-            symbols = fetch_nifty100_symbols()
+            symbols, sym_source = fetch_nifty100_symbols()
         except Exception as e:
-            st.error(f"Failed to fetch Nifty 100 list: {e}")
-            st.info("Check your internet connection. The niftyindices.com endpoint may be temporarily unavailable.")
+            st.error(f"Failed to load Nifty 100 list: {e}")
             st.stop()
 
     st.sidebar.metric("Stocks in Index", len(symbols))
+    st.sidebar.caption(f"List source: {sym_source}")
 
     with st.spinner(f"Downloading daily data for {len(symbols)} stocks..."):
         data = download_ohlcv(symbols)
