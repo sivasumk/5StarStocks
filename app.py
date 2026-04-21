@@ -22,9 +22,8 @@ def fetch_fno_stocks():
     return set(df["Symbol"].str.strip().tolist())
 
 
-# ─── Download OHLCV ─────────────────────────────────────────────
-@st.cache_data(ttl=300, show_spinner=False)
-def download_data(symbols, interval):
+# ─── Download OHLCV (single chunk, no cache) ────────────────────
+def download_chunk(symbols, interval):
     tickers = [s + ".NS" for s in symbols]
     period = "6mo" if interval == "1d" else "2y"
     data = yf.download(tickers, period=period, interval=interval,
@@ -260,6 +259,32 @@ def compute_signals(data, symbols, interval, fno_set=None):
     return longs_df, shorts_df
 
 
+# ─── Orchestrator: batch download + compute, cache only results ──
+@st.cache_data(ttl=600, show_spinner=False)
+def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
+    symbols = list(symbols_tuple)
+    fno_set = set(fno_tuple)
+    all_longs = []
+    all_shorts = []
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i + chunk_size]
+        try:
+            data = download_chunk(chunk, interval)
+        except Exception:
+            continue
+        longs_df, shorts_df = compute_signals(data, chunk, interval, fno_set)
+        if not longs_df.empty:
+            all_longs.append(longs_df)
+        if not shorts_df.empty:
+            all_shorts.append(shorts_df)
+        del data
+    longs = (pd.concat(all_longs, ignore_index=True)
+             .sort_values("VPA Score", ascending=False)) if all_longs else pd.DataFrame()
+    shorts = (pd.concat(all_shorts, ignore_index=True)
+              .sort_values("VPA Score", ascending=False)) if all_shorts else pd.DataFrame()
+    return longs, shorts
+
+
 # ─── UI ──────────────────────────────────────────────────────────
 st.title("5-Star Stocks — EMA34 Slope Scanner")
 st.caption("EMA34 Band + EMA5 Slope(3-bar) + VPA | Nifty 500")
@@ -287,11 +312,9 @@ st.sidebar.metric("Stocks", len(symbols))
 st.sidebar.metric("F&O Stocks", len(fno_set))
 
 status = st.empty()
-status.info(f"Downloading {timeframe.lower()} data for {len(symbols)} stocks...")
-data = download_data(symbols, interval)
-
-status.info("Scanning for signals...")
-longs_df, shorts_df = compute_signals(data, symbols, interval, fno_set)
+status.info(f"Scanning {len(symbols)} stocks ({timeframe.lower()})... "
+            "this takes ~2-3 min on first run, cached for 10 min after.")
+longs_df, shorts_df = scan_all(tuple(symbols), interval, tuple(sorted(fno_set)))
 status.empty()
 
 st.sidebar.markdown("---")
