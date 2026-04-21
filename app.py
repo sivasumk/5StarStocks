@@ -53,6 +53,7 @@ def compute_signals(data, symbols, interval, fno_set=None):
 
     longs = []
     shorts = []
+    exited = []
 
     for sym in symbols:
         ticker = sym + ".NS"
@@ -191,29 +192,56 @@ def compute_signals(data, symbols, interval, fno_set=None):
             # ── EXIT ──
             if pos == 1:
                 do_exit = False
+                reason = ""
                 if lo <= sl_price:
-                    do_exit = True
+                    do_exit = True; reason = "Stop Loss"
                 elif sl_val < -exit_slope_rev:
-                    do_exit = True
+                    do_exit = True; reason = "Slope Flip"
                 elif cl < el_j:
-                    do_exit = True
+                    do_exit = True; reason = "Below Band"
                 elif (j - entry_bar) >= max_hold:
-                    do_exit = True
+                    do_exit = True; reason = "Max Hold"
                 if do_exit:
+                    # Record only exits that happened on the LAST bar
+                    if j == n - 1:
+                        exit_pnl = (cl - entry_price) / entry_price * 100
+                        exited.append({
+                            "Symbol": sym,
+                            "Side": "Long",
+                            "Reason": reason,
+                            "Entry": round(float(entry_price), 2),
+                            "Exit": round(float(cl), 2),
+                            "PnL %": round(float(exit_pnl), 2),
+                            "Bars Held": j - entry_bar,
+                            "Entry Date": df.index[entry_bar].strftime('%Y-%m-%d'),
+                        })
                     last_exit_bar = j
                     pos = 0
 
             elif pos == -1:
                 do_exit = False
+                reason = ""
                 if hi >= sl_price:
-                    do_exit = True
+                    do_exit = True; reason = "Stop Loss"
                 elif sl_val > exit_slope_rev:
-                    do_exit = True
+                    do_exit = True; reason = "Slope Flip"
                 elif cl > eh:
-                    do_exit = True
+                    do_exit = True; reason = "Above Band"
                 elif (j - entry_bar) >= max_hold:
-                    do_exit = True
+                    do_exit = True; reason = "Max Hold"
                 if do_exit:
+                    if j == n - 1:
+                        exit_pnl = (entry_price - cl) / entry_price * 100
+                        exited.append({
+                            "Symbol": sym,
+                            "Side": "Short",
+                            "Reason": reason,
+                            "Entry": round(float(entry_price), 2),
+                            "Exit": round(float(cl), 2),
+                            "PnL %": round(float(exit_pnl), 2),
+                            "Bars Held": j - entry_bar,
+                            "Entry Date": df.index[entry_bar].strftime('%Y-%m-%d'),
+                        })
                     last_exit_bar = j
                     pos = 0
 
@@ -256,7 +284,8 @@ def compute_signals(data, symbols, interval, fno_set=None):
 
     longs_df = pd.DataFrame(longs).sort_values("VPA Score", ascending=False) if longs else pd.DataFrame()
     shorts_df = pd.DataFrame(shorts).sort_values("VPA Score", ascending=False) if shorts else pd.DataFrame()
-    return longs_df, shorts_df
+    exited_df = pd.DataFrame(exited).sort_values("PnL %", ascending=False) if exited else pd.DataFrame()
+    return longs_df, shorts_df, exited_df
 
 
 # ─── Orchestrator: batch download + compute, cache only results ──
@@ -266,6 +295,7 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
     fno_set = set(fno_tuple)
     all_longs = []
     all_shorts = []
+    all_exited = []
     failed_chunks = 0
     empty_chunks = 0
     processed = 0
@@ -281,24 +311,28 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
         if data is None or data.empty:
             empty_chunks += 1
             continue
-        longs_df, shorts_df = compute_signals(data, chunk, interval, fno_set)
+        longs_df, shorts_df, exited_df = compute_signals(data, chunk, interval, fno_set)
         processed += len(chunk)
         if not longs_df.empty:
             all_longs.append(longs_df)
         if not shorts_df.empty:
             all_shorts.append(shorts_df)
+        if not exited_df.empty:
+            all_exited.append(exited_df)
         del data
     longs = (pd.concat(all_longs, ignore_index=True)
              .sort_values("VPA Score", ascending=False)) if all_longs else pd.DataFrame()
     shorts = (pd.concat(all_shorts, ignore_index=True)
               .sort_values("VPA Score", ascending=False)) if all_shorts else pd.DataFrame()
+    exited = (pd.concat(all_exited, ignore_index=True)
+              .sort_values("PnL %", ascending=False)) if all_exited else pd.DataFrame()
     diagnostics = {
         "processed": processed,
         "failed_chunks": failed_chunks,
         "empty_chunks": empty_chunks,
         "errors": errors[:3],
     }
-    return longs, shorts, diagnostics
+    return longs, shorts, exited, diagnostics
 
 
 # ─── UI ──────────────────────────────────────────────────────────
@@ -330,7 +364,7 @@ st.sidebar.metric("F&O Stocks", len(fno_set))
 status = st.empty()
 status.info(f"Scanning {len(symbols)} stocks ({timeframe.lower()})... "
             "this takes ~2-3 min on first run, cached for 10 min after.")
-longs_df, shorts_df, diag = scan_all(tuple(symbols), interval, tuple(sorted(fno_set)))
+longs_df, shorts_df, exited_df, diag = scan_all(tuple(symbols), interval, tuple(sorted(fno_set)))
 status.empty()
 
 # Show diagnostics if anything went wrong
@@ -343,6 +377,7 @@ if diag["failed_chunks"] > 0 or diag["empty_chunks"] > 0 or diag["processed"] < 
 st.sidebar.markdown("---")
 st.sidebar.metric("Long Signals", len(longs_df))
 st.sidebar.metric("Short Signals", len(shorts_df))
+st.sidebar.metric("Exited Today", len(exited_df))
 st.sidebar.caption(f"Last scan: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 col1, col2 = st.columns(2)
@@ -361,3 +396,10 @@ with col2:
         st.info("No short signals found.")
     else:
         st.dataframe(shorts_df.reset_index(drop=True), use_container_width=True, hide_index=True)
+
+st.subheader(f"Exited Today ({len(exited_df)})", divider="orange")
+st.caption("Positions that closed on the most recent bar")
+if exited_df.empty:
+    st.info("No exits on the latest bar.")
+else:
+    st.dataframe(exited_df.reset_index(drop=True), use_container_width=True, hide_index=True)
