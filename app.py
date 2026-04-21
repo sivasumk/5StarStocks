@@ -266,13 +266,23 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
     fno_set = set(fno_tuple)
     all_longs = []
     all_shorts = []
+    failed_chunks = 0
+    empty_chunks = 0
+    processed = 0
+    errors = []
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
         try:
             data = download_chunk(chunk, interval)
-        except Exception:
+        except Exception as e:
+            failed_chunks += 1
+            errors.append(f"Chunk {i//chunk_size + 1} download failed: {e}")
+            continue
+        if data is None or data.empty:
+            empty_chunks += 1
             continue
         longs_df, shorts_df = compute_signals(data, chunk, interval, fno_set)
+        processed += len(chunk)
         if not longs_df.empty:
             all_longs.append(longs_df)
         if not shorts_df.empty:
@@ -282,7 +292,13 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
              .sort_values("VPA Score", ascending=False)) if all_longs else pd.DataFrame()
     shorts = (pd.concat(all_shorts, ignore_index=True)
               .sort_values("VPA Score", ascending=False)) if all_shorts else pd.DataFrame()
-    return longs, shorts
+    diagnostics = {
+        "processed": processed,
+        "failed_chunks": failed_chunks,
+        "empty_chunks": empty_chunks,
+        "errors": errors[:3],
+    }
+    return longs, shorts, diagnostics
 
 
 # ─── UI ──────────────────────────────────────────────────────────
@@ -314,8 +330,15 @@ st.sidebar.metric("F&O Stocks", len(fno_set))
 status = st.empty()
 status.info(f"Scanning {len(symbols)} stocks ({timeframe.lower()})... "
             "this takes ~2-3 min on first run, cached for 10 min after.")
-longs_df, shorts_df = scan_all(tuple(symbols), interval, tuple(sorted(fno_set)))
+longs_df, shorts_df, diag = scan_all(tuple(symbols), interval, tuple(sorted(fno_set)))
 status.empty()
+
+# Show diagnostics if anything went wrong
+if diag["failed_chunks"] > 0 or diag["empty_chunks"] > 0 or diag["processed"] < len(symbols) // 2:
+    with st.expander(f"⚠️ Scan diagnostics ({diag['processed']}/{len(symbols)} processed)"):
+        st.write(f"Failed chunks: {diag['failed_chunks']}, Empty chunks: {diag['empty_chunks']}")
+        for err in diag["errors"]:
+            st.code(err)
 
 st.sidebar.markdown("---")
 st.sidebar.metric("Long Signals", len(longs_df))
