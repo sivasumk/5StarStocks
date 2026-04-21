@@ -28,7 +28,7 @@ def download_data(symbols, interval):
     tickers = [s + ".NS" for s in symbols]
     period = "6mo" if interval == "1d" else "2y"
     data = yf.download(tickers, period=period, interval=interval,
-                       group_by="ticker", threads=True, progress=False)
+                       group_by="ticker", threads=False, progress=False)
     return data
 
 
