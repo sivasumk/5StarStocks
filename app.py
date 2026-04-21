@@ -271,28 +271,28 @@ with st.sidebar:
 
 interval = "1d" if timeframe == "Daily" else "1wk"
 
-with st.spinner("Fetching Nifty 500 list..."):
-    try:
-        symbols = fetch_nifty500()
-    except Exception as e:
-        st.error(f"Failed to fetch Nifty 500 list: {e}")
-        st.stop()
+try:
+    symbols = fetch_nifty500()
+except Exception as e:
+    st.error(f"Failed to load Nifty 500 list: {e}")
+    st.stop()
 
-with st.spinner("Fetching F&O stock list..."):
-    try:
-        fno_set = fetch_fno_stocks()
-    except Exception:
-        fno_set = set()
-        st.sidebar.warning("F&O list unavailable")
+try:
+    fno_set = fetch_fno_stocks()
+except Exception:
+    fno_set = set()
+    st.sidebar.warning("F&O list unavailable")
 
 st.sidebar.metric("Stocks", len(symbols))
 st.sidebar.metric("F&O Stocks", len(fno_set))
 
-with st.spinner(f"Downloading {timeframe.lower()} data for {len(symbols)} stocks..."):
-    data = download_data(symbols, interval)
+status = st.empty()
+status.info(f"Downloading {timeframe.lower()} data for {len(symbols)} stocks...")
+data = download_data(symbols, interval)
 
-with st.spinner("Scanning for signals..."):
-    longs_df, shorts_df = compute_signals(data, symbols, interval, fno_set)
+status.info("Scanning for signals...")
+longs_df, shorts_df = compute_signals(data, symbols, interval, fno_set)
+status.empty()
 
 st.sidebar.markdown("---")
 st.sidebar.metric("Long Signals", len(longs_df))
