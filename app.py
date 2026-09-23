@@ -2,11 +2,12 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 st.set_page_config(page_title="5-Star Stocks Scanner", layout="wide")
 
 BASE_DIR = Path(__file__).parent
+IST = timezone(timedelta(hours=5, minutes=30))  # no DST, so a fixed offset is exact
 
 # ─── Nifty 500 stock list (static CSV) ─────────────────────────
 @st.cache_data
@@ -262,6 +263,7 @@ def compute_signals(data, symbols, interval, fno_set=None):
                 "F&O": "Yes" if is_fno else "",
                 "Close": round(float(c[-1]), 2),
                 "Entry": round(float(entry_price), 2),
+                "Stop": round(float(sl_price), 2),
                 "Slope %": round(float(entry_slope), 2),
                 "Rel Vol": round(float(entry_rel_vol), 2),
                 "VPA Score": entry_score,
@@ -279,6 +281,7 @@ def compute_signals(data, symbols, interval, fno_set=None):
                 "Symbol": sym,
                 "Close": round(float(c[-1]), 2),
                 "Entry": round(float(entry_price), 2),
+                "Stop": round(float(sl_price), 2),
                 "Slope %": round(float(entry_slope), 2),
                 "Rel Vol": round(float(entry_rel_vol), 2),
                 "VPA Score": entry_score,
@@ -305,6 +308,8 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
     failed_chunks = 0
     empty_chunks = 0
     processed = 0
+    missing = []
+    last_bar = None
     errors = []
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
@@ -318,7 +323,14 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
             empty_chunks += 1
             continue
         longs_df, shorts_df, exited_df = compute_signals(data, chunk, interval, fno_set)
-        processed += len(chunk)
+        present = set(data.columns.get_level_values(0))
+        for sym in chunk:
+            if sym + ".NS" in present and data[sym + ".NS"]["Close"].notna().any():
+                processed += 1
+            else:
+                missing.append(sym)
+        chunk_last = data.index.max()
+        last_bar = chunk_last if last_bar is None else max(last_bar, chunk_last)
         if not longs_df.empty:
             all_longs.append(longs_df)
         if not shorts_df.empty:
@@ -337,6 +349,9 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
         "failed_chunks": failed_chunks,
         "empty_chunks": empty_chunks,
         "errors": errors[:3],
+        "missing": missing,
+        "scan_time": datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"),
+        "last_bar": last_bar.strftime("%Y-%m-%d") if last_bar is not None else None,
     }
     return longs, shorts, exited, diagnostics
 
@@ -374,17 +389,36 @@ longs_df, shorts_df, exited_df, diag = scan_all(tuple(symbols), interval, tuple(
 status.empty()
 
 # Show diagnostics if anything went wrong
-if diag["failed_chunks"] > 0 or diag["empty_chunks"] > 0 or diag["processed"] < len(symbols) // 2:
+if diag["failed_chunks"] or diag["empty_chunks"] or diag["missing"]:
     with st.expander(f"⚠️ Scan diagnostics ({diag['processed']}/{len(symbols)} processed)"):
         st.write(f"Failed chunks: {diag['failed_chunks']}, Empty chunks: {diag['empty_chunks']}")
         for err in diag["errors"]:
             st.code(err)
+        if diag["missing"]:
+            st.write(f"No data for {len(diag['missing'])} symbols: "
+                     + ", ".join(diag["missing"][:50])
+                     + (" …" if len(diag["missing"]) > 50 else ""))
 
 st.sidebar.markdown("---")
 st.sidebar.metric("Long Signals", len(longs_df))
 st.sidebar.metric("Short Signals", len(shorts_df))
-st.sidebar.metric("Exited Today", len(exited_df))
-st.sidebar.caption(f"Last scan: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+st.sidebar.metric("Exited on Latest Bar", len(exited_df))
+st.sidebar.caption(f"Last scan: {diag['scan_time']}")
+st.sidebar.caption(f"Latest bar: {diag['last_bar']}")
+
+# The latest bar is still forming during market hours (and all week on the
+# weekly timeframe), so its entries/exits can change before it closes.
+now_ist = datetime.now(IST)
+market_open = (now_ist.weekday() < 5
+               and (9, 15) <= (now_ist.hour, now_ist.minute) < (15, 30))
+bar_forming = diag["last_bar"] is not None and (
+    (interval == "1d" and market_open and diag["last_bar"] == now_ist.strftime("%Y-%m-%d"))
+    or (interval == "1wk" and now_ist.weekday() < 5
+        and now_ist.date() - timedelta(days=now_ist.weekday()) <= datetime.strptime(diag["last_bar"], "%Y-%m-%d").date()))
+if bar_forming:
+    st.warning(f"The latest {'daily' if interval == '1d' else 'weekly'} bar "
+               f"({diag['last_bar']}) is still forming — signals and exits on it "
+               "may change before it closes.")
 
 col1, col2 = st.columns(2)
 
@@ -393,7 +427,7 @@ with col1:
     if longs_df.empty:
         st.info("No long signals found.")
     else:
-        st.dataframe(longs_df.reset_index(drop=True), use_container_width=True, hide_index=True)
+        st.dataframe(longs_df.reset_index(drop=True), width="stretch", hide_index=True)
 
 with col2:
     st.subheader(f"Short Signals ({len(shorts_df)})", divider="red")
@@ -401,11 +435,13 @@ with col2:
     if shorts_df.empty:
         st.info("No short signals found.")
     else:
-        st.dataframe(shorts_df.reset_index(drop=True), use_container_width=True, hide_index=True)
+        st.dataframe(shorts_df.reset_index(drop=True), width="stretch", hide_index=True)
 
-st.subheader(f"Exited Today ({len(exited_df)})", divider="orange")
-st.caption("Positions that closed on the most recent bar")
+st.subheader(f"Exited on Latest Bar ({len(exited_df)})", divider="orange")
+st.caption(f"Positions that closed on the {diag['last_bar']} "
+           f"{'daily' if interval == '1d' else 'weekly'} bar. "
+           "Stop-loss exits are priced at the stop (or the open on a gap).")
 if exited_df.empty:
     st.info("No exits on the latest bar.")
 else:
-    st.dataframe(exited_df.reset_index(drop=True), use_container_width=True, hide_index=True)
+    st.dataframe(exited_df.reset_index(drop=True), width="stretch", hide_index=True)

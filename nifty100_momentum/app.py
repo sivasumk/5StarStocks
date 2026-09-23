@@ -49,32 +49,35 @@ def fetch_nifty100_symbols():
         "Accept": "text/csv,text/plain,*/*",
         "Referer": "https://www.niftyindices.com/",
     }
-    source = "static CSV"
+    def _symbols(df):
+        sym_col = next(c for c in df.columns if "symbol" in c.lower())
+        return df[sym_col].dropna().astype(str).str.strip().tolist()
+
+    # The live endpoint sometimes answers 200 with an HTML block page, so
+    # the column lookup must sit inside the fallback too.
     try:
         resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
-        df = pd.read_csv(StringIO(resp.text))
+        symbols = _symbols(pd.read_csv(StringIO(resp.text)))
+        if len(symbols) < 90:
+            raise ValueError(f"only {len(symbols)} symbols in live list")
         source = "niftyindices.com (live)"
     except Exception:
-        df = pd.read_csv(BASE_DIR / "nifty100.csv")
-
-    sym_col = [c for c in df.columns if "symbol" in c.lower()][0]
-    symbols = df[sym_col].str.strip().tolist()
+        symbols = _symbols(pd.read_csv(BASE_DIR / "nifty100.csv"))
+        source = "static CSV"
     return sorted(symbols), source
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def download_ohlcv(symbols):
     """Download 6 months of daily OHLCV for given symbols."""
     tickers = [s + ".NS" for s in symbols]
     data = yf.download(
         tickers, period="6mo", interval="1d",
-        group_by="ticker", threads=True, progress=False,
+        group_by="ticker", threads=False, progress=False,
     )
     return data
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def download_index():
     """Download Nifty 100 index for relative-strength computation."""
     idx = yf.download("^CNX100", period="6mo", interval="1d", progress=False)
@@ -117,33 +120,36 @@ def compute_obv(close, volume):
     return (volume * direction).cumsum()
 
 
-def compute_atr(high, low, close, period=14):
-    tr = pd.concat([
+def _wilder(series, period):
+    """Wilder's smoothing (RMA), as used by TradingView's ATR/ADX."""
+    return series.ewm(alpha=1/period, adjust=False).mean()
+
+
+def _true_range(high, low, close):
+    return pd.concat([
         high - low,
         (high - close.shift()).abs(),
         (low - close.shift()).abs(),
     ], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
+
+
+def compute_atr(high, low, close, period=14):
+    return _wilder(_true_range(high, low, close), period)
 
 
 def compute_adx(high, low, close, period=14):
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
-    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    up = high.diff()
+    down = -low.diff()
+    # Compare the raw moves; equal moves give neither side a DM
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
 
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs(),
-    ], axis=1).max(axis=1)
-
-    atr = tr.ewm(span=period, adjust=False).mean()
-    plus_di = 100 * plus_dm.ewm(span=period, adjust=False).mean() / atr
-    minus_di = 100 * minus_dm.ewm(span=period, adjust=False).mean() / atr
+    atr = compute_atr(high, low, close, period)
+    plus_di = 100 * _wilder(plus_dm, period) / atr
+    minus_di = 100 * _wilder(minus_dm, period) / atr
 
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = dx.ewm(span=period, adjust=False).mean()
+    adx = _wilder(dx, period)
     return adx, plus_di, minus_di
 
 
@@ -209,19 +215,35 @@ def score_atr(atr_ratio, price_direction):
 #  MAIN ANALYSIS — processes all stocks
 # ═══════════════════════════════════════════════════════════════════
 
-def analyse_all(data, symbols, index_data):
+def index_returns(index_data):
+    """Index 20-day return series, or None if the index data is unusable.
+
+    Kept dated so each trend point is compared with the index return on
+    the same day.
+    """
+    if index_data is None or index_data.empty or "Close" not in index_data.columns:
+        return None
+    idx_close = index_data["Close"].dropna()
+    if hasattr(idx_close, "columns"):
+        idx_close = idx_close.iloc[:, 0]
+    if len(idx_close) < 21:
+        return None
+    return (idx_close / idx_close.shift(20) - 1) * 100
+
+
+def trend_dir(arr):
+    if len(arr) < 2:
+        return "→"
+    diff = arr[-1] - arr[0]
+    if diff > 3:
+        return "↑"
+    elif diff < -3:
+        return "↓"
+    return "→"
+
+
+def analyse_all(data, symbols, idx_ret_series):
     """Compute indicators, scores and 7-day trends for every stock."""
-
-    # Index 20-day return series for relative strength (dated, so each
-    # trend point is compared with the index return on the same day)
-    idx_ret_series = None
-    if index_data is not None and "Close" in index_data.columns and len(index_data) >= 21:
-        idx_close = index_data["Close"].dropna()
-        if hasattr(idx_close, "columns"):
-            idx_close = idx_close.iloc[:, 0]
-        if len(idx_close) >= 21:
-            idx_ret_series = (idx_close / idx_close.shift(20) - 1) * 100
-
     rows = []
     skipped = []
     for sym in symbols:
@@ -403,17 +425,6 @@ def analyse_all(data, symbols, index_data):
         trend_rs.append(round(s_rs, 1))
         trend_obv_scores.append(round(s_obv, 1))
 
-        # Trend direction helper
-        def trend_dir(arr):
-            if len(arr) < 2:
-                return "→"
-            diff = arr[-1] - arr[0]
-            if diff > 3:
-                return "↑"
-            elif diff < -3:
-                return "↓"
-            return "→"
-
         # RSI zone label
         rsi_val = cur["rsi"]
         if rsi_val >= 70:
@@ -469,16 +480,17 @@ def analyse_all(data, symbols, index_data):
         # SMI crossover: find most recent within last 10 bars
         cross_lookback = min(10, len(smi))
         cross_label = "—"
-        cross_bars_ago = None
+        cross_dir = ""      # "bull" / "bear" / "" (none within lookback)
+        cross_age = np.nan  # bars since the cross, 0 = today
         for i in range(1, cross_lookback + 1):
             idx = -i
             if cross_up.iloc[idx]:
                 cross_label = f"▲ Bull ({i-1}d)" if i > 1 else "▲ Bull (today)"
-                cross_bars_ago = i - 1
+                cross_dir, cross_age = "bull", i - 1
                 break
             if cross_down.iloc[idx]:
                 cross_label = f"▼ Bear ({i-1}d)" if i > 1 else "▼ Bear (today)"
-                cross_bars_ago = -(i - 1) - 1  # negative indicates bearish
+                cross_dir, cross_age = "bear", i - 1
                 break
         # Direction of current SMI vs signal (for colour)
         smi_vs_sig = "Above" if smi.iloc[-1] > smi_sig.iloc[-1] else "Below"
@@ -517,6 +529,8 @@ def analyse_all(data, symbols, index_data):
             "SMI Sig": round(cur["smi_sig"], 1),
             "SMI Zone": smi_zone,
             "SMI Cross": cross_label,
+            "_cross_dir": cross_dir,
+            "_cross_age": cross_age,
             "SMI vs Sig": smi_vs_sig,
             "SMI Trend": trend_smi_vals,
             "SMI Dir": trend_dir(trend_smi_vals),
@@ -553,9 +567,27 @@ def analyse_all(data, symbols, index_data):
         result = result.sort_values("Score", ascending=False).reset_index(drop=True)
         result.index = result.index + 1
         result.index.name = "Rank"
-    if skipped:
-        print(f"SKIPPED STOCKS: {skipped}")
     return result, skipped
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def run_analysis(symbols):
+    """Download and score everything; cached so filter changes are instant."""
+    data = download_ohlcv(list(symbols))
+    try:
+        idx_ret_series = index_returns(download_index())
+    except Exception:
+        idx_ret_series = None
+    result, skipped = analyse_all(data, symbols, idx_ret_series)
+    last_bar = None
+    if data is not None and not data.empty:
+        last_bar = data.index.max().strftime("%Y-%m-%d")
+    meta = {
+        "index_ok": idx_ret_series is not None,
+        "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "last_bar": last_bar,
+    }
+    return result, skipped, meta
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -685,18 +717,15 @@ def main():
     st.sidebar.metric("Stocks in Index", len(symbols))
     st.sidebar.caption(f"List source: {sym_source}")
 
-    with st.spinner(f"Downloading daily data for {len(symbols)} stocks..."):
-        data = download_ohlcv(symbols)
-
-    with st.spinner("Downloading Nifty 100 index data..."):
+    with st.spinner(f"Downloading and scoring {len(symbols)} stocks..."):
         try:
-            index_data = download_index()
-        except Exception:
-            index_data = None
-            st.sidebar.warning("Index data unavailable — RS will use 0 baseline")
+            result, skipped, meta = run_analysis(tuple(symbols))
+        except Exception as e:
+            st.error(f"Price download failed: {e}")
+            st.stop()
 
-    with st.spinner("Computing indicators & ranking..."):
-        result, skipped = analyse_all(data, symbols, index_data)
+    if not meta["index_ok"]:
+        st.sidebar.warning("Index data unavailable — RS will use 0 baseline")
 
     if result.empty:
         st.error("No data could be processed. Try refreshing.")
@@ -711,32 +740,11 @@ def main():
     filtered = result.copy()
     if signal_filter:
         filtered = filtered[filtered["Signal"].isin(signal_filter)]
-    if smi_cross_filter == "Recent Bull Cross (≤3d)":
-        mask = filtered["SMI Cross"].str.startswith("▲")
-        # Extract day count from label to enforce ≤3
-        def _recent_bull(lbl):
-            if not isinstance(lbl, str) or not lbl.startswith("▲"):
-                return False
-            if "today" in lbl:
-                return True
-            try:
-                days = int(lbl.split("(")[1].split("d")[0])
-                return days <= 3
-            except Exception:
-                return False
-        filtered = filtered[filtered["SMI Cross"].map(_recent_bull)]
-    elif smi_cross_filter == "Recent Bear Cross (≤3d)":
-        def _recent_bear(lbl):
-            if not isinstance(lbl, str) or not lbl.startswith("▼"):
-                return False
-            if "today" in lbl:
-                return True
-            try:
-                days = int(lbl.split("(")[1].split("d")[0])
-                return days <= 3
-            except Exception:
-                return False
-        filtered = filtered[filtered["SMI Cross"].map(_recent_bear)]
+    cross_dir = {"Recent Bull Cross (≤3d)": "bull",
+                 "Recent Bear Cross (≤3d)": "bear"}.get(smi_cross_filter)
+    if cross_dir:
+        filtered = filtered[(filtered["_cross_dir"] == cross_dir)
+                            & (filtered["_cross_age"] <= 3)]
     if zone_filter:
         filtered = filtered[filtered["RSI Zone"].isin(zone_filter)]
     if ema_filter:
@@ -769,7 +777,7 @@ def main():
     st.sidebar.metric("Strong Short", n_ss)
     avg_score = result["Score"].mean()
     st.sidebar.metric("Avg Score", f"{avg_score:.1f}")
-    st.sidebar.caption(f"Last scan: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    st.sidebar.caption(f"Last scan: {meta['scan_time']} · latest bar: {meta['last_bar']}")
 
     # ── Market breadth bar ──
     col_b1, col_b2, col_b3, col_b4 = st.columns(4)
@@ -875,6 +883,7 @@ def main():
     long_trades = result[result["Signal"].isin(["Strong Long", "Long"])].head(15)
     short_trades = result[result["Signal"].isin(["Strong Short", "Short"])].sort_values("Score").head(15)
 
+    st.caption("Candidate tables rank the full list; sidebar filters don't apply here.")
     col_t, col_bo = st.columns(2)
     with col_t:
         st.subheader(f"Long Trade Candidates ({len(long_trades)})", divider="green")

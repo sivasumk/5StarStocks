@@ -6,12 +6,15 @@ EMA 34 / EMA 5 trend.
 
 ## Features
 
-- Live Nifty 100 constituent list from niftyindices.com
+- Live Nifty 100 constituent list from niftyindices.com, falling back to the
+  bundled `nifty100.csv` when the live list is blocked or malformed
 - 7 indicators per stock with 7-day sparkline trends
 - Composite momentum score (-100 to +100)
 - Full dashboard + compact ranking views
-- Sidebar filters: RSI zone, EMA status, ATR state, ADX strength
-- Top 10 / Bottom 10 summary tables
+- Trade signal (Strong Long … Strong Short) and SMI signal-line crossovers
+- Sidebar filters: trade signal, recent SMI cross, RSI zone, EMA status,
+  ATR state, ADX strength, score range
+- Top 15 long / short trade-candidate tables (unfiltered)
 
 ## Scoring weights
 
@@ -24,6 +27,9 @@ EMA 34 / EMA 5 trend.
 | ADX + DI direction | 15% |
 | OBV | 10% |
 | ATR expansion | 5% |
+
+ATR and ADX use Wilder smoothing, matching TradingView. Any component that
+cannot be computed (missing data) scores 0 rather than skewing the total.
 
 ## Run locally
 
