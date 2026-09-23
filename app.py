@@ -189,12 +189,15 @@ def compute_signals(data, symbols, interval, fno_set=None):
                         + (1 if ut else 0)
                         + (1 if cp < 0.4 else 0))
 
-            # ── EXIT ──
-            if pos == 1:
+            # ── EXIT ── (from the bar after entry; the entry bar's low/high
+            # printed before the close we entered at)
+            if pos == 1 and j > entry_bar:
                 do_exit = False
                 reason = ""
+                exit_price = cl
                 if lo <= sl_price:
                     do_exit = True; reason = "Stop Loss"
+                    exit_price = min(op_j, sl_price)  # gap below stop fills at open
                 elif sl_val < -exit_slope_rev:
                     do_exit = True; reason = "Slope Flip"
                 elif cl < el_j:
@@ -204,13 +207,13 @@ def compute_signals(data, symbols, interval, fno_set=None):
                 if do_exit:
                     # Record only exits that happened on the LAST bar
                     if j == n - 1:
-                        exit_pnl = (cl - entry_price) / entry_price * 100
+                        exit_pnl = (exit_price - entry_price) / entry_price * 100
                         exited.append({
                             "Symbol": sym,
                             "Side": "Long",
                             "Reason": reason,
                             "Entry": round(float(entry_price), 2),
-                            "Exit": round(float(cl), 2),
+                            "Exit": round(float(exit_price), 2),
                             "PnL %": round(float(exit_pnl), 2),
                             "Bars Held": j - entry_bar,
                             "Entry Date": df.index[entry_bar].strftime('%Y-%m-%d'),
@@ -218,11 +221,13 @@ def compute_signals(data, symbols, interval, fno_set=None):
                     last_exit_bar = j
                     pos = 0
 
-            elif pos == -1:
+            elif pos == -1 and j > entry_bar:
                 do_exit = False
                 reason = ""
+                exit_price = cl
                 if hi >= sl_price:
                     do_exit = True; reason = "Stop Loss"
+                    exit_price = max(op_j, sl_price)  # gap above stop fills at open
                 elif sl_val > exit_slope_rev:
                     do_exit = True; reason = "Slope Flip"
                 elif cl > eh:
@@ -230,14 +235,15 @@ def compute_signals(data, symbols, interval, fno_set=None):
                 elif (j - entry_bar) >= max_hold:
                     do_exit = True; reason = "Max Hold"
                 if do_exit:
-                    if j == n - 1:
-                        exit_pnl = (entry_price - cl) / entry_price * 100
+                    # Shorts are only reported for F&O stocks
+                    if j == n - 1 and fno_set and sym in fno_set:
+                        exit_pnl = (entry_price - exit_price) / entry_price * 100
                         exited.append({
                             "Symbol": sym,
                             "Side": "Short",
                             "Reason": reason,
                             "Entry": round(float(entry_price), 2),
-                            "Exit": round(float(cl), 2),
+                            "Exit": round(float(exit_price), 2),
                             "PnL %": round(float(exit_pnl), 2),
                             "Bars Held": j - entry_bar,
                             "Entry Date": df.index[entry_bar].strftime('%Y-%m-%d'),

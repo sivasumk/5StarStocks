@@ -152,6 +152,9 @@ def compute_adx(high, low, close, period=14):
 # ═══════════════════════════════════════════════════════════════════
 
 def _clamp(x, lo=-100, hi=100):
+    # NaN would otherwise come out as `hi` (min(hi, nan) returns hi)
+    if pd.isna(x):
+        return 0
     return max(lo, min(hi, x))
 
 
@@ -192,7 +195,8 @@ def score_obv(obv_series, avg_vol):
     if len(obv_series) < 8 or avg_vol == 0:
         return 0
     slope = (obv_series.iloc[-1] - obv_series.iloc[-8]) / (avg_vol * 7) * 100
-    return _clamp(slope * 15)
+    # slope is already in [-100, 100]; x15 pinned nearly every stock at ±100
+    return _clamp(slope * 1.5)
 
 
 def score_atr(atr_ratio, price_direction):
@@ -208,14 +212,15 @@ def score_atr(atr_ratio, price_direction):
 def analyse_all(data, symbols, index_data):
     """Compute indicators, scores and 7-day trends for every stock."""
 
-    # Index return for relative strength
+    # Index 20-day return series for relative strength (dated, so each
+    # trend point is compared with the index return on the same day)
+    idx_ret_series = None
     if index_data is not None and "Close" in index_data.columns and len(index_data) >= 21:
         idx_close = index_data["Close"].dropna()
         if hasattr(idx_close, "columns"):
             idx_close = idx_close.iloc[:, 0]
-        idx_ret_20 = (idx_close.iloc[-1] / idx_close.iloc[-21] - 1) * 100 if len(idx_close) >= 21 else 0
-    else:
-        idx_ret_20 = 0
+        if len(idx_close) >= 21:
+            idx_ret_series = (idx_close / idx_close.shift(20) - 1) * 100
 
     rows = []
     skipped = []
@@ -278,6 +283,12 @@ def analyse_all(data, symbols, index_data):
         # 20-day stock return for relative strength
         stock_ret_20 = (close / close.shift(20) - 1) * 100
 
+        # Index 20-day return aligned to this stock's dates (0 if unavailable)
+        if idx_ret_series is not None:
+            idx_ret = idx_ret_series.reindex(close.index, method="ffill").fillna(0)
+        else:
+            idx_ret = pd.Series(0.0, index=close.index)
+
         # ── Current values (last bar) ──
         cur = {
             "rsi": rsi.iloc[-1],
@@ -307,7 +318,7 @@ def analyse_all(data, symbols, index_data):
         s_smi = score_smi(cur["smi"])
         s_adx = score_adx(cur["adx"], cur["plus_di"], cur["minus_di"])
         s_ema = score_ema(cur["close"], cur["ema34"], cur["ema5_slope"])
-        s_rs  = score_rs(cur["stock_ret"], idx_ret_20)
+        s_rs  = score_rs(cur["stock_ret"], idx_ret.iloc[-1])
         s_obv = score_obv(obv, cur["avg_vol"])
         price_dir = 1 if cur["close"] > ema34.iloc[-1] else -1
         s_atr = score_atr(cur["atr_ratio"], price_dir)
@@ -358,7 +369,7 @@ def analyse_all(data, symbols, index_data):
                 ts_smi = score_smi(t_smi)
                 ts_adx = score_adx(t_adx_v, t_pdi, t_mdi)
                 ts_ema = score_ema(t_cl, t_ema34, t_ema5s)
-                ts_rs  = score_rs(t_sret, idx_ret_20)
+                ts_rs  = score_rs(t_sret, idx_ret.iloc[idx])
 
                 # OBV score at that point
                 obv_slice = obv.iloc[:idx+1] if idx != -1 else obv
