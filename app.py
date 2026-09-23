@@ -52,9 +52,10 @@ def compute_signals(data, symbols, interval, fno_set=None):
     max_hold = 30
     cooldown = 3
 
+    fno = fno_set or set()
     longs = []
     shorts = []
-    exited = []
+    trades = []   # every closed trade in the downloaded history
 
     for sym in symbols:
         ticker = sym + ".NS"
@@ -192,68 +193,51 @@ def compute_signals(data, symbols, interval, fno_set=None):
 
             # ── EXIT ── (from the bar after entry; the entry bar's low/high
             # printed before the close we entered at)
-            if pos == 1 and j > entry_bar:
+            if pos != 0 and j > entry_bar:
                 do_exit = False
                 reason = ""
                 exit_price = cl
-                if lo <= sl_price:
-                    do_exit = True; reason = "Stop Loss"
-                    exit_price = min(op_j, sl_price)  # gap below stop fills at open
-                elif sl_val < -exit_slope_rev:
-                    do_exit = True; reason = "Slope Flip"
-                elif cl < el_j:
-                    do_exit = True; reason = "Below Band"
-                elif (j - entry_bar) >= max_hold:
-                    do_exit = True; reason = "Max Hold"
+                if pos == 1:
+                    if lo <= sl_price:
+                        do_exit = True; reason = "Stop Loss"
+                        exit_price = min(op_j, sl_price)  # gap below stop fills at open
+                    elif sl_val < -exit_slope_rev:
+                        do_exit = True; reason = "Slope Flip"
+                    elif cl < el_j:
+                        do_exit = True; reason = "Below Band"
+                    elif (j - entry_bar) >= max_hold:
+                        do_exit = True; reason = "Max Hold"
+                else:
+                    if hi >= sl_price:
+                        do_exit = True; reason = "Stop Loss"
+                        exit_price = max(op_j, sl_price)  # gap above stop fills at open
+                    elif sl_val > exit_slope_rev:
+                        do_exit = True; reason = "Slope Flip"
+                    elif cl > eh:
+                        do_exit = True; reason = "Above Band"
+                    elif (j - entry_bar) >= max_hold:
+                        do_exit = True; reason = "Max Hold"
                 if do_exit:
-                    # Record only exits that happened on the LAST bar
-                    if j == n - 1:
-                        exit_pnl = (exit_price - entry_price) / entry_price * 100
-                        exited.append({
-                            "Symbol": sym,
-                            "Side": "Long",
-                            "Reason": reason,
-                            "Entry": round(float(entry_price), 2),
-                            "Exit": round(float(exit_price), 2),
-                            "PnL %": round(float(exit_pnl), 2),
-                            "Bars Held": j - entry_bar,
-                            "Entry Date": df.index[entry_bar].strftime('%Y-%m-%d'),
-                        })
-                    last_exit_bar = j
-                    pos = 0
-
-            elif pos == -1 and j > entry_bar:
-                do_exit = False
-                reason = ""
-                exit_price = cl
-                if hi >= sl_price:
-                    do_exit = True; reason = "Stop Loss"
-                    exit_price = max(op_j, sl_price)  # gap above stop fills at open
-                elif sl_val > exit_slope_rev:
-                    do_exit = True; reason = "Slope Flip"
-                elif cl > eh:
-                    do_exit = True; reason = "Above Band"
-                elif (j - entry_bar) >= max_hold:
-                    do_exit = True; reason = "Max Hold"
-                if do_exit:
-                    # Shorts are only reported for F&O stocks
-                    if j == n - 1 and fno_set and sym in fno_set:
-                        exit_pnl = (entry_price - exit_price) / entry_price * 100
-                        exited.append({
-                            "Symbol": sym,
-                            "Side": "Short",
-                            "Reason": reason,
-                            "Entry": round(float(entry_price), 2),
-                            "Exit": round(float(exit_price), 2),
-                            "PnL %": round(float(exit_pnl), 2),
-                            "Bars Held": j - entry_bar,
-                            "Entry Date": df.index[entry_bar].strftime('%Y-%m-%d'),
-                        })
+                    exit_pnl = pos * (exit_price - entry_price) / entry_price * 100
+                    trades.append({
+                        "Symbol": sym,
+                        "Side": "Long" if pos == 1 else "Short",
+                        "F&O": "Yes" if sym in fno else "",
+                        "Reason": reason,
+                        "Entry": round(float(entry_price), 2),
+                        "Exit": round(float(exit_price), 2),
+                        "PnL %": round(float(exit_pnl), 2),
+                        "Bars Held": j - entry_bar,
+                        "VPA Score": entry_score,
+                        "Entry Date": df.index[entry_bar].strftime('%Y-%m-%d'),
+                        "Exit Date": df.index[j].strftime('%Y-%m-%d'),
+                        "_latest": j == n - 1,
+                    })
                     last_exit_bar = j
                     pos = 0
 
         # After walking all bars, check final state
-        is_fno = fno_set and sym in fno_set
+        is_fno = sym in fno
         if pos == 1:
             bars_held = n - 1 - entry_bar
             live_pnl = (c[-1] - entry_price) / entry_price * 100
@@ -293,8 +277,11 @@ def compute_signals(data, symbols, interval, fno_set=None):
 
     longs_df = pd.DataFrame(longs).sort_values("VPA Score", ascending=False) if longs else pd.DataFrame()
     shorts_df = pd.DataFrame(shorts).sort_values("VPA Score", ascending=False) if shorts else pd.DataFrame()
-    exited_df = pd.DataFrame(exited).sort_values("PnL %", ascending=False) if exited else pd.DataFrame()
-    return longs_df, shorts_df, exited_df
+    trades_df = pd.DataFrame(trades)
+    if not trades_df.empty:
+        # Shorts are only traded in F&O stocks
+        trades_df = trades_df[(trades_df["Side"] == "Long") | (trades_df["F&O"] == "Yes")]
+    return longs_df, shorts_df, trades_df
 
 
 # ─── Orchestrator: batch download + compute, cache only results ──
@@ -304,7 +291,7 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
     fno_set = set(fno_tuple)
     all_longs = []
     all_shorts = []
-    all_exited = []
+    all_trades = []
     failed_chunks = 0
     empty_chunks = 0
     processed = 0
@@ -322,7 +309,7 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
         if data is None or data.empty:
             empty_chunks += 1
             continue
-        longs_df, shorts_df, exited_df = compute_signals(data, chunk, interval, fno_set)
+        longs_df, shorts_df, trades_df = compute_signals(data, chunk, interval, fno_set)
         present = set(data.columns.get_level_values(0))
         for sym in chunk:
             if sym + ".NS" in present and data[sym + ".NS"]["Close"].notna().any():
@@ -335,15 +322,14 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
             all_longs.append(longs_df)
         if not shorts_df.empty:
             all_shorts.append(shorts_df)
-        if not exited_df.empty:
-            all_exited.append(exited_df)
+        if not trades_df.empty:
+            all_trades.append(trades_df)
         del data
     longs = (pd.concat(all_longs, ignore_index=True)
              .sort_values("VPA Score", ascending=False)) if all_longs else pd.DataFrame()
     shorts = (pd.concat(all_shorts, ignore_index=True)
               .sort_values("VPA Score", ascending=False)) if all_shorts else pd.DataFrame()
-    exited = (pd.concat(all_exited, ignore_index=True)
-              .sort_values("PnL %", ascending=False)) if all_exited else pd.DataFrame()
+    trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
     diagnostics = {
         "processed": processed,
         "failed_chunks": failed_chunks,
@@ -353,7 +339,7 @@ def scan_all(symbols_tuple, interval, fno_tuple, chunk_size=50):
         "scan_time": datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"),
         "last_bar": last_bar.strftime("%Y-%m-%d") if last_bar is not None else None,
     }
-    return longs, shorts, exited, diagnostics
+    return longs, shorts, trades, diagnostics
 
 
 # ─── UI ──────────────────────────────────────────────────────────
@@ -385,8 +371,15 @@ st.sidebar.metric("F&O Stocks", len(fno_set))
 status = st.empty()
 status.info(f"Scanning {len(symbols)} stocks ({timeframe.lower()})... "
             "this takes ~2-3 min on first run, cached for 10 min after.")
-longs_df, shorts_df, exited_df, diag = scan_all(tuple(symbols), interval, tuple(sorted(fno_set)))
+longs_df, shorts_df, trades_df, diag = scan_all(tuple(symbols), interval, tuple(sorted(fno_set)))
 status.empty()
+
+EXIT_COLS = ["Symbol", "Side", "Reason", "Entry", "Exit", "PnL %", "Bars Held", "Entry Date"]
+if trades_df.empty:
+    exited_df = pd.DataFrame()
+else:
+    exited_df = (trades_df[trades_df["_latest"]][EXIT_COLS]
+                 .sort_values("PnL %", ascending=False))
 
 # Show diagnostics if anything went wrong
 if diag["failed_chunks"] or diag["empty_chunks"] or diag["missing"]:
@@ -445,3 +438,59 @@ if exited_df.empty:
     st.info("No exits on the latest bar.")
 else:
     st.dataframe(exited_df.reset_index(drop=True), width="stretch", hide_index=True)
+
+
+# ─── Trade history ───────────────────────────────────────────────
+def trade_stats(t):
+    """Win rate, average P&L, profit factor etc. for a set of closed trades."""
+    wins = t.loc[t["PnL %"] > 0, "PnL %"]
+    losses = t.loc[t["PnL %"] <= 0, "PnL %"]
+    return pd.Series({
+        "Trades": len(t),
+        "Win %": round(len(wins) / len(t) * 100, 1),
+        "Avg PnL %": round(t["PnL %"].mean(), 2),
+        "Avg Win %": round(wins.mean(), 2) if len(wins) else 0.0,
+        "Avg Loss %": round(losses.mean(), 2) if len(losses) else 0.0,
+        "Profit Factor": round(wins.sum() / -losses.sum(), 2) if losses.sum() < 0 else float("inf"),
+        "Avg Bars": round(t["Bars Held"].mean(), 1),
+    })
+
+
+st.subheader(f"Trade History ({len(trades_df)})", divider="blue")
+if trades_df.empty:
+    st.info("No closed trades in the downloaded history.")
+else:
+    first = trades_df["Entry Date"].min()
+    st.caption(f"Every trade the rules closed between {first} and {diag['last_bar']} "
+               f"({'6 months daily' if interval == '1d' else '2 years weekly'}). "
+               "P&L is per trade, before costs; shorts are F&O stocks only.")
+    hist = trades_df.drop(columns="_latest")
+
+    overall = trade_stats(hist)
+    m = st.columns(4)
+    m[0].metric("Closed Trades", int(overall["Trades"]))
+    m[1].metric("Win Rate", f"{overall['Win %']}%")
+    m[2].metric("Avg P&L / Trade", f"{overall['Avg PnL %']}%")
+    m[3].metric("Profit Factor", overall["Profit Factor"])
+    m = st.columns(4)
+    m[0].metric("Avg Win", f"{overall['Avg Win %']}%")
+    m[1].metric("Avg Loss", f"{overall['Avg Loss %']}%")
+    m[2].metric("Avg Bars Held", overall["Avg Bars"])
+
+    by = st.radio("Break down by", ["Side", "Reason", "VPA Score", "Exit Month"],
+                  horizontal=True)
+    grp = hist.assign(**{"Exit Month": hist["Exit Date"].str[:7]})
+    keys = ["Side", by] if by != "Side" else ["Side"]
+    st.dataframe(grp.groupby(keys).apply(trade_stats, include_groups=False).reset_index(),
+                 width="stretch", hide_index=True)
+
+    f1, f2 = st.columns(2)
+    side_f = f1.multiselect("Side", ["Long", "Short"], default=[])
+    reason_f = f2.multiselect("Exit reason", sorted(hist["Reason"].unique()), default=[])
+    view = hist
+    if side_f:
+        view = view[view["Side"].isin(side_f)]
+    if reason_f:
+        view = view[view["Reason"].isin(reason_f)]
+    st.dataframe(view.sort_values("Exit Date", ascending=False).reset_index(drop=True),
+                 width="stretch", hide_index=True)
