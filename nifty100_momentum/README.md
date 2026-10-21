@@ -48,6 +48,13 @@ A backtest on the current Nifty 100 (monthly, Nov 2021 – Aug 2026) found
 on its own, which is why it sits beside the score rather than inside it.
 Two years of daily data are downloaded to cover the 12-month lookback.
 
+## 52-week high / low
+
+**From 52W High %** is the close against the highest intraday high of the
+last 252 sessions (0 = at the high, -20 = 20% below it). **From 52W Low %**
+is the close against the lowest intraday low (0 = at the low). Stocks listed
+for under a year use the history they have. Both are shown for context only.
+
 ## Run locally
 
 ```bash

@@ -317,6 +317,13 @@ def analyse_all(data, symbols, idx_ret_series):
         else:
             mom_12_1 = np.nan
 
+        # Distance from the 52-week (252-session) intraday high and low;
+        # newer listings use whatever history they have
+        hi_52 = high.iloc[-MOM_LONG:].max()
+        lo_52 = low.iloc[-MOM_LONG:].min()
+        from_hi = (close.iloc[-1] / hi_52 - 1) * 100 if hi_52 > 0 else np.nan
+        from_lo = (close.iloc[-1] / lo_52 - 1) * 100 if lo_52 > 0 else np.nan
+
         # Index 20-day return aligned to this stock's dates (0 if unavailable)
         if idx_ret_series is not None:
             idx_ret = idx_ret_series.reindex(close.index, method="ffill").fillna(0)
@@ -532,6 +539,8 @@ def analyse_all(data, symbols, idx_ret_series):
             "Score Trend": trend_scores,
             "Score Dir": trend_dir(trend_scores),
             "12-1 %": round(float(mom_12_1), 1) if pd.notna(mom_12_1) else np.nan,
+            "From 52W High %": round(float(from_hi), 1) if pd.notna(from_hi) else np.nan,
+            "From 52W Low %": round(float(from_lo), 1) if pd.notna(from_lo) else np.nan,
 
             "RSI": round(rsi_val, 1),
             "RSI Zone": rsi_zone,
@@ -847,7 +856,7 @@ def main():
         # Compact: just symbol, score, key indicators, trend arrows
         compact_cols = [
             "Symbol", "Close", "Signal", "Score", "Score Dir",
-            "12-1 %", "12-1 Rank", "Blend",
+            "12-1 %", "12-1 Rank", "Blend", "From 52W High %", "From 52W Low %",
             "RSI", "RSI Zone", "RSI Dir",
             "SMI", "SMI Zone", "SMI Cross", "SMI Dir",
             "ADX", "ADX Str", "ADX Dir",
@@ -858,7 +867,8 @@ def main():
         ]
         display_df = filtered[compact_cols].copy()
 
-        one_dp = ["Score", "12-1 %", "Blend", "RSI", "SMI", "ADX", "RS Score", "OBV Score"]
+        one_dp = ["Score", "12-1 %", "Blend", "From 52W High %", "From 52W Low %",
+                  "RSI", "SMI", "ADX", "RS Score", "OBV Score"]
         styled = display_df.style \
             .format({**{c: "{:.1f}" for c in one_dp},
                      "Close": "{:.2f}", "EMA 5 Slope%": "{:.3f}"}, na_rep="—") \
@@ -877,7 +887,7 @@ def main():
         # Configure columns for st.dataframe with sparkline charts
         display_cols = [
             "Symbol", "Close", "Signal", "Score", "Score Trend", "Score Dir",
-            "12-1 %", "12-1 Rank", "Blend",
+            "12-1 %", "12-1 Rank", "Blend", "From 52W High %", "From 52W Low %",
             "RSI", "RSI Zone", "RSI Trend", "RSI Dir",
             "SMI", "SMI Sig", "SMI Zone", "SMI Cross", "SMI vs Sig", "SMI Trend", "SMI Dir",
             "ADX", "+DI", "-DI", "ADX Str", "ADX Trend", "ADX Dir",
@@ -923,6 +933,14 @@ def main():
                 format="%.1f",
                 help="80% score percentile + 20% 12-1 percentile (0-100)",
             ),
+            "From 52W High %": st.column_config.NumberColumn(
+                "From 52W High %", format="%.1f",
+                help="Close vs the 52-week intraday high (0 = at the high)",
+            ),
+            "From 52W Low %": st.column_config.NumberColumn(
+                "From 52W Low %", format="%.1f",
+                help="Close vs the 52-week intraday low (0 = at the low)",
+            ),
             "RSI": st.column_config.NumberColumn(format="%.1f"),
             "SMI": st.column_config.NumberColumn(format="%.1f"),
             "SMI Sig": st.column_config.NumberColumn("SMI Signal", format="%.1f"),
@@ -948,7 +966,7 @@ def main():
     # ── Long / Short trade candidates ──
     st.markdown("---")
     summary_cols = ["Symbol", "Close", "Signal", "Score", "12-1 %", "12-1 Rank",
-                    "RSI Zone", "SMI Zone", "ADX Str", "EMA Status", "ATR State"]
+                    "From 52W High %", "From 52W Low %", "RSI Zone", "SMI Zone", "ADX Str", "EMA Status", "ATR State"]
 
     rank_key = RANK_KEYS[rank_choice]
     long_trades = result[result["Signal"].isin(["Strong Long", "Long"])].head(15)
