@@ -31,6 +31,23 @@ EMA 34 / EMA 5 trend.
 ATR and ADX use Wilder smoothing, matching TradingView. Any component that
 cannot be computed (missing data) scores 0 rather than skewing the total.
 
+## 12-1 month momentum
+
+Each stock also shows its **12-1 return** (price change from 12 months ago to
+1 month ago, skipping the latest month) and its **12-1 Rank** within the index.
+It is not part of the score. The sidebar's **Rank by** switch orders the
+tables by:
+
+- **Score** (default) — the weighted momentum score above
+- **12-1 Return** — long-term momentum alone
+- **Blend (80/20)** — 80% score percentile + 20% 12-1 percentile
+
+Stocks listed for less than ~13 months have no 12-1 value and sort last.
+A backtest on the current Nifty 100 (monthly, Nov 2021 – Aug 2026) found
+12-1 nearly uncorrelated with the score but not statistically significant
+on its own, which is why it sits beside the score rather than inside it.
+Two years of daily data are downloaded to cover the 12-month lookback.
+
 ## Run locally
 
 ```bash

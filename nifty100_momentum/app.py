@@ -30,6 +30,12 @@ WEIGHTS = {
 
 TREND_DAYS = 7   # number of trading days for trend computation
 
+# 12-1 month momentum: return from 12 months ago to 1 month ago, skipping
+# the latest month. Shown and rankable, but not part of the score itself.
+MOM_LONG = 252   # ~12 months of trading days
+MOM_SKIP = 21    # ~1 month
+BLEND_MOM = 0.20 # weight of the 12-1 percentile in the "Blend" ranking
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  DATA FETCHING
@@ -69,10 +75,10 @@ def fetch_nifty100_symbols():
 
 
 def download_ohlcv(symbols):
-    """Download 6 months of daily OHLCV for given symbols."""
+    """Download 2 years of daily OHLCV (12-1 momentum needs 13+ months)."""
     tickers = [s + ".NS" for s in symbols]
     data = yf.download(
-        tickers, period="6mo", interval="1d",
+        tickers, period="2y", interval="1d",
         group_by="ticker", threads=False, progress=False,
     )
     return data
@@ -80,7 +86,7 @@ def download_ohlcv(symbols):
 
 def download_index():
     """Download Nifty 100 index for relative-strength computation."""
-    idx = yf.download("^CNX100", period="6mo", interval="1d", progress=False)
+    idx = yf.download("^CNX100", period="2y", interval="1d", progress=False)
     return idx
 
 
@@ -305,6 +311,12 @@ def analyse_all(data, symbols, idx_ret_series):
         # 20-day stock return for relative strength
         stock_ret_20 = (close / close.shift(20) - 1) * 100
 
+        # 12-1 month return (NaN for stocks listed less than ~13 months)
+        if len(close) > MOM_LONG:
+            mom_12_1 = (close.iloc[-1 - MOM_SKIP] / close.iloc[-1 - MOM_LONG] - 1) * 100
+        else:
+            mom_12_1 = np.nan
+
         # Index 20-day return aligned to this stock's dates (0 if unavailable)
         if idx_ret_series is not None:
             idx_ret = idx_ret_series.reindex(close.index, method="ffill").fillna(0)
@@ -519,6 +531,7 @@ def analyse_all(data, symbols, idx_ret_series):
             "Score": round(momentum, 1),
             "Score Trend": trend_scores,
             "Score Dir": trend_dir(trend_scores),
+            "12-1 %": round(float(mom_12_1), 1) if pd.notna(mom_12_1) else np.nan,
 
             "RSI": round(rsi_val, 1),
             "RSI Zone": rsi_zone,
@@ -564,10 +577,30 @@ def analyse_all(data, symbols, idx_ret_series):
 
     result = pd.DataFrame(rows)
     if not result.empty:
+        # 1 = strongest 12-1 return; stocks without 13 months of history get none
+        result["12-1 Rank"] = result["12-1 %"].rank(ascending=False, method="min").astype("Int64")
+        # Blend: score percentile with a 20% tilt to the 12-1 percentile
+        # (score percentile alone where 12-1 is unavailable)
+        score_pct = result["Score"].rank(pct=True)
+        mom_pct = result["12-1 %"].rank(pct=True)
+        result["Blend"] = (100 * ((1 - BLEND_MOM) * score_pct + BLEND_MOM * mom_pct)
+                           .fillna(score_pct)).round(1)
         result = result.sort_values("Score", ascending=False).reset_index(drop=True)
         result.index = result.index + 1
         result.index.name = "Rank"
     return result, skipped
+
+
+RANK_KEYS = {"Score": "Score", "12-1 Return": "12-1 %", "Blend (80/20)": "Blend"}
+
+
+def rank_by(result, choice):
+    """Re-sort the table by the chosen key and renumber the Rank index."""
+    key = RANK_KEYS[choice]
+    out = result.sort_values(key, ascending=False, na_position="last").reset_index(drop=True)
+    out.index = out.index + 1
+    out.index.name = "Rank"
+    return out
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -667,6 +700,14 @@ def main():
             st.cache_data.clear()
 
         st.markdown("---")
+        rank_choice = st.radio(
+            "Rank by", list(RANK_KEYS), index=0,
+            help="Score = the weighted momentum score. 12-1 Return = price "
+                 "change from 12 months ago to 1 month ago. Blend = 80% score "
+                 "percentile + 20% 12-1 percentile.",
+        )
+
+        st.markdown("---")
         st.subheader("Filters")
         signal_filter = st.multiselect(
             "Trade Signal",
@@ -699,6 +740,11 @@ def main():
             default=[],
         )
         score_range = st.slider("Momentum Score Range", -100, 100, (-100, 100))
+        mom_filter = st.radio(
+            "12-1 Return",
+            ["All", "Positive", "Negative"],
+            index=0, horizontal=True,
+        )
 
         st.markdown("---")
         st.subheader("Score Weights")
@@ -731,6 +777,8 @@ def main():
         st.error("No data could be processed. Try refreshing.")
         st.stop()
 
+    result = rank_by(result, rank_choice)
+
     if skipped:
         with st.sidebar.expander(f"Skipped Stocks ({len(skipped)})"):
             for sym, reason in skipped:
@@ -756,6 +804,10 @@ def main():
     filtered = filtered[
         (filtered["Score"] >= score_range[0]) & (filtered["Score"] <= score_range[1])
     ]
+    if mom_filter == "Positive":
+        filtered = filtered[filtered["12-1 %"] > 0]
+    elif mom_filter == "Negative":
+        filtered = filtered[filtered["12-1 %"] < 0]
 
     # ── Signal counts ──
     sig_counts = result["Signal"].value_counts()
@@ -795,6 +847,7 @@ def main():
         # Compact: just symbol, score, key indicators, trend arrows
         compact_cols = [
             "Symbol", "Close", "Signal", "Score", "Score Dir",
+            "12-1 %", "12-1 Rank", "Blend",
             "RSI", "RSI Zone", "RSI Dir",
             "SMI", "SMI Zone", "SMI Cross", "SMI Dir",
             "ADX", "ADX Str", "ADX Dir",
@@ -805,7 +858,11 @@ def main():
         ]
         display_df = filtered[compact_cols].copy()
 
-        styled = display_df.style.map(color_score, subset=["Score"]) \
+        one_dp = ["Score", "12-1 %", "Blend", "RSI", "SMI", "ADX", "RS Score", "OBV Score"]
+        styled = display_df.style \
+            .format({**{c: "{:.1f}" for c in one_dp},
+                     "Close": "{:.2f}", "EMA 5 Slope%": "{:.3f}"}, na_rep="—") \
+            .map(color_score, subset=["Score"]) \
             .map(color_rsi, subset=["RSI"]) \
             .map(color_signal, subset=["Signal"]) \
             .map(color_smi_cross, subset=["SMI Cross"]) \
@@ -820,6 +877,7 @@ def main():
         # Configure columns for st.dataframe with sparkline charts
         display_cols = [
             "Symbol", "Close", "Signal", "Score", "Score Trend", "Score Dir",
+            "12-1 %", "12-1 Rank", "Blend",
             "RSI", "RSI Zone", "RSI Trend", "RSI Dir",
             "SMI", "SMI Sig", "SMI Zone", "SMI Cross", "SMI vs Sig", "SMI Trend", "SMI Dir",
             "ADX", "+DI", "-DI", "ADX Str", "ADX Trend", "ADX Dir",
@@ -854,6 +912,17 @@ def main():
                 "OBV 7D", width="small", y_min=-100, y_max=100,
             ),
             "Score": st.column_config.NumberColumn(format="%.1f"),
+            "12-1 %": st.column_config.NumberColumn(
+                "12-1 %", format="%.1f",
+                help="Return from 12 months ago to 1 month ago",
+            ),
+            "12-1 Rank": st.column_config.NumberColumn(
+                help="1 = strongest 12-1 return in the index",
+            ),
+            "Blend": st.column_config.NumberColumn(
+                format="%.1f",
+                help="80% score percentile + 20% 12-1 percentile (0-100)",
+            ),
             "RSI": st.column_config.NumberColumn(format="%.1f"),
             "SMI": st.column_config.NumberColumn(format="%.1f"),
             "SMI Sig": st.column_config.NumberColumn("SMI Signal", format="%.1f"),
@@ -878,12 +947,16 @@ def main():
 
     # ── Long / Short trade candidates ──
     st.markdown("---")
-    summary_cols = ["Symbol", "Close", "Signal", "Score", "RSI Zone", "SMI Zone", "ADX Str", "EMA Status", "ATR State"]
+    summary_cols = ["Symbol", "Close", "Signal", "Score", "12-1 %", "12-1 Rank",
+                    "RSI Zone", "SMI Zone", "ADX Str", "EMA Status", "ATR State"]
 
+    rank_key = RANK_KEYS[rank_choice]
     long_trades = result[result["Signal"].isin(["Strong Long", "Long"])].head(15)
-    short_trades = result[result["Signal"].isin(["Strong Short", "Short"])].sort_values("Score").head(15)
+    short_trades = (result[result["Signal"].isin(["Strong Short", "Short"])]
+                    .sort_values(rank_key, na_position="last").head(15))
 
-    st.caption("Candidate tables rank the full list; sidebar filters don't apply here.")
+    st.caption(f"Candidate tables rank the full list by {rank_choice}; "
+               "sidebar filters don't apply here.")
     col_t, col_bo = st.columns(2)
     with col_t:
         st.subheader(f"Long Trade Candidates ({len(long_trades)})", divider="green")
