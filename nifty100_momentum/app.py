@@ -5,7 +5,7 @@ import yfinance as yf
 import requests
 from io import StringIO
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 BASE_DIR = Path(__file__).parent
 
@@ -632,6 +632,31 @@ def run_analysis(symbols):
     return result, skipped, meta
 
 
+def data_freshness(last_bar):
+    """Compare the latest bar with the last session that should have closed.
+
+    Returns (level, message); level is "ok", "partial" or "stale". Weekdays
+    only, so an NSE holiday can show as one day stale.
+    """
+    if last_bar is None:
+        return "stale", "No price data loaded"
+    now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    today = now_ist.date()
+    # Today's bar is final only after the 15:30 IST close
+    expected = today if now_ist.hour * 60 + now_ist.minute >= 15 * 60 + 30 else today - timedelta(days=1)
+    while expected.weekday() >= 5:
+        expected -= timedelta(days=1)
+    bar = datetime.strptime(last_bar, "%Y-%m-%d").date()
+    label = bar.strftime("%a %d %b %Y")
+    if bar > expected:
+        return "partial", f"Data as of {label} — intraday, today's bar is not final"
+    lag = int(np.busday_count(bar, expected))
+    if lag == 0:
+        return "ok", f"Data as of {label} close"
+    return "stale", (f"Data as of {label} — {lag} trading day{'s' if lag > 1 else ''} "
+                     f"behind (expected {expected.strftime('%a %d %b')})")
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  STREAMLIT UI
 # ═══════════════════════════════════════════════════════════════════
@@ -778,6 +803,10 @@ def main():
         except Exception as e:
             st.error(f"Price download failed: {e}")
             st.stop()
+
+    level, fresh_msg = data_freshness(meta["last_bar"])
+    {"ok": st.success, "partial": st.info, "stale": st.warning}[level](
+        f"{fresh_msg} · scanned {meta['scan_time']}", icon="📅")
 
     if not meta["index_ok"]:
         st.sidebar.warning("Index data unavailable — RS will use 0 baseline")
