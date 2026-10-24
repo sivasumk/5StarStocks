@@ -28,7 +28,13 @@ WEIGHTS = {
     "atr":      0.05,   # ATR expansion/contraction energy
 }
 
-TREND_DAYS = 7   # number of trading days for trend computation
+TREND_DAYS = 7   # number of bars for trend computation
+
+# Bar unit suffix per timeframe; weekly bars are resampled from the daily download
+TIMEFRAMES = {"Daily": "d", "Weekly": "w"}
+# Price moves over N weekly bars are ~sqrt(5) larger than over N daily bars;
+# without this the EMA and RS scores pin at ±100 far more often on weekly
+PRICE_SCALE = {"Daily": 1.0, "Weekly": 1 / np.sqrt(5)}
 
 # 12-1 month momentum: return from 12 months ago to 1 month ago, skipping
 # the latest month. Shown and rankable, but not part of the score itself.
@@ -88,6 +94,13 @@ def download_index():
     """Download Nifty 100 index for relative-strength computation."""
     idx = yf.download("^CNX100", period="2y", interval="1d", progress=False)
     return idx
+
+
+def to_weekly(df):
+    """Resample daily OHLCV to weeks ending Friday; the current week may be partial."""
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    return df.resample("W-FRI").agg({k: v for k, v in agg.items() if k in df.columns}) \
+             .dropna(subset=["Close"])
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -187,19 +200,19 @@ def score_adx(adx_val, plus_di, minus_di):
     return direction * strength
 
 
-def score_ema(close_val, ema34_val, ema5_slope_pct):
+def score_ema(close_val, ema34_val, ema5_slope_pct, scale=1.0):
     """Price vs EMA34 position + EMA5 slope."""
     if ema34_val == 0:
         return 0
-    pos = _clamp((close_val - ema34_val) / ema34_val * 1000)
-    slope = _clamp(ema5_slope_pct * 40)
+    pos = _clamp((close_val - ema34_val) / ema34_val * 1000 * scale)
+    slope = _clamp(ema5_slope_pct * 40 * scale)
     return 0.5 * pos + 0.5 * slope
 
 
-def score_rs(stock_ret, index_ret):
+def score_rs(stock_ret, index_ret, scale=1.0):
     """Relative strength: outperformance in pct points → score."""
     diff = stock_ret - index_ret
-    return _clamp(diff * 8)
+    return _clamp(diff * 8 * scale)
 
 
 def score_obv(obv_series, avg_vol):
@@ -221,8 +234,8 @@ def score_atr(atr_ratio, price_direction):
 #  MAIN ANALYSIS — processes all stocks
 # ═══════════════════════════════════════════════════════════════════
 
-def index_returns(index_data):
-    """Index 20-day return series, or None if the index data is unusable.
+def index_returns(index_data, timeframe="Daily"):
+    """Index 20-bar return series, or None if the index data is unusable.
 
     Kept dated so each trend point is compared with the index return on
     the same day.
@@ -232,6 +245,8 @@ def index_returns(index_data):
     idx_close = index_data["Close"].dropna()
     if hasattr(idx_close, "columns"):
         idx_close = idx_close.iloc[:, 0]
+    if timeframe == "Weekly":
+        idx_close = idx_close.resample("W-FRI").last().dropna()
     if len(idx_close) < 21:
         return None
     return (idx_close / idx_close.shift(20) - 1) * 100
@@ -248,8 +263,12 @@ def trend_dir(arr):
     return "→"
 
 
-def analyse_all(data, symbols, idx_ret_series):
-    """Compute indicators, scores and 7-day trends for every stock."""
+def analyse_all(data, symbols, idx_ret_series, timeframe="Daily"):
+    """Compute indicators, scores and 7-bar trends for every stock.
+
+    Indicators run on daily or weekly bars; the 12-1 return and the 52-week
+    high/low always come from daily bars so they match across timeframes.
+    """
     rows = []
     skipped = []
     for sym in symbols:
@@ -262,10 +281,6 @@ def analyse_all(data, symbols, idx_ret_series):
                 continue
         except Exception as exc:
             skipped.append((sym, f"Error: {exc}"))
-            continue
-
-        if len(df) < 35:
-            skipped.append((sym, f"Only {len(df)} bars (need 35)"))
             continue
 
         close = df["Close"]
@@ -281,6 +296,27 @@ def analyse_all(data, symbols, idx_ret_series):
             low = low.iloc[:, 0]
         if hasattr(vol, "columns"):
             vol = vol.iloc[:, 0]
+
+        # 12-1 month return (NaN for stocks listed less than ~13 months)
+        if len(close) > MOM_LONG:
+            mom_12_1 = (close.iloc[-1 - MOM_SKIP] / close.iloc[-1 - MOM_LONG] - 1) * 100
+        else:
+            mom_12_1 = np.nan
+
+        # Distance from the 52-week (252-session) intraday high and low;
+        # newer listings use whatever history they have
+        hi_52 = high.iloc[-MOM_LONG:].max()
+        lo_52 = low.iloc[-MOM_LONG:].min()
+        from_hi = (close.iloc[-1] / hi_52 - 1) * 100 if hi_52 > 0 else np.nan
+        from_lo = (close.iloc[-1] / lo_52 - 1) * 100 if lo_52 > 0 else np.nan
+
+        if timeframe == "Weekly":
+            wk = to_weekly(pd.DataFrame({"High": high, "Low": low, "Close": close, "Volume": vol}))
+            close, high, low, vol = wk["Close"], wk["High"], wk["Low"], wk["Volume"]
+
+        if len(close) < 35:
+            skipped.append((sym, f"Only {len(close)} bars (need 35)"))
+            continue
 
         # ── Compute indicators on full series ──
         rsi = compute_rsi(close)
@@ -308,23 +344,10 @@ def analyse_all(data, symbols, idx_ret_series):
         # OBV average volume for normalisation
         avg_vol_20 = vol.rolling(20).mean()
 
-        # 20-day stock return for relative strength
+        # 20-bar stock return for relative strength
         stock_ret_20 = (close / close.shift(20) - 1) * 100
 
-        # 12-1 month return (NaN for stocks listed less than ~13 months)
-        if len(close) > MOM_LONG:
-            mom_12_1 = (close.iloc[-1 - MOM_SKIP] / close.iloc[-1 - MOM_LONG] - 1) * 100
-        else:
-            mom_12_1 = np.nan
-
-        # Distance from the 52-week (252-session) intraday high and low;
-        # newer listings use whatever history they have
-        hi_52 = high.iloc[-MOM_LONG:].max()
-        lo_52 = low.iloc[-MOM_LONG:].min()
-        from_hi = (close.iloc[-1] / hi_52 - 1) * 100 if hi_52 > 0 else np.nan
-        from_lo = (close.iloc[-1] / lo_52 - 1) * 100 if lo_52 > 0 else np.nan
-
-        # Index 20-day return aligned to this stock's dates (0 if unavailable)
+        # Index 20-bar return aligned to this stock's dates (0 if unavailable)
         if idx_ret_series is not None:
             idx_ret = idx_ret_series.reindex(close.index, method="ffill").fillna(0)
         else:
@@ -355,11 +378,12 @@ def analyse_all(data, symbols, idx_ret_series):
             continue
 
         # ── Component scores ──
+        k = PRICE_SCALE[timeframe]
         s_rsi = score_rsi(cur["rsi"])
         s_smi = score_smi(cur["smi"])
         s_adx = score_adx(cur["adx"], cur["plus_di"], cur["minus_di"])
-        s_ema = score_ema(cur["close"], cur["ema34"], cur["ema5_slope"])
-        s_rs  = score_rs(cur["stock_ret"], idx_ret.iloc[-1])
+        s_ema = score_ema(cur["close"], cur["ema34"], cur["ema5_slope"], k)
+        s_rs  = score_rs(cur["stock_ret"], idx_ret.iloc[-1], k)
         s_obv = score_obv(obv, cur["avg_vol"])
         price_dir = 1 if cur["close"] > ema34.iloc[-1] else -1
         s_atr = score_atr(cur["atr_ratio"], price_dir)
@@ -374,7 +398,7 @@ def analyse_all(data, symbols, idx_ret_series):
             + WEIGHTS["atr"] * s_atr
         )
 
-        # ── 7-day trend: compute momentum score for each of last 7 bars ──
+        # ── 7-bar trend: compute momentum score for each of last 7 bars ──
         trend_scores = []
         trend_rsi = []
         trend_smi_vals = []
@@ -399,7 +423,7 @@ def analyse_all(data, symbols, idx_ret_series):
                 t_atr_r = atr_ratio.iloc[idx]
                 t_avg_vol = avg_vol_20.iloc[idx]
 
-                # Stock return 20 days back from that point
+                # Stock return 20 bars back from that point
                 ret_idx = idx - 20
                 if abs(ret_idx) < len(close):
                     t_sret = (close.iloc[idx] / close.iloc[ret_idx] - 1) * 100
@@ -409,8 +433,8 @@ def analyse_all(data, symbols, idx_ret_series):
                 ts_rsi = score_rsi(t_rsi)
                 ts_smi = score_smi(t_smi)
                 ts_adx = score_adx(t_adx_v, t_pdi, t_mdi)
-                ts_ema = score_ema(t_cl, t_ema34, t_ema5s)
-                ts_rs  = score_rs(t_sret, idx_ret.iloc[idx])
+                ts_ema = score_ema(t_cl, t_ema34, t_ema5s, k)
+                ts_rs  = score_rs(t_sret, idx_ret.iloc[idx], k)
 
                 # OBV score at that point
                 obv_slice = obv.iloc[:idx+1] if idx != -1 else obv
@@ -500,15 +524,16 @@ def analyse_all(data, symbols, idx_ret_series):
         cross_lookback = min(10, len(smi))
         cross_label = "—"
         cross_dir = ""      # "bull" / "bear" / "" (none within lookback)
-        cross_age = np.nan  # bars since the cross, 0 = today
+        cross_age = np.nan  # bars since the cross, 0 = latest bar
+        unit = TIMEFRAMES[timeframe]
         for i in range(1, cross_lookback + 1):
             idx = -i
             if cross_up.iloc[idx]:
-                cross_label = f"▲ Bull ({i-1}d)" if i > 1 else "▲ Bull (today)"
+                cross_label = f"▲ Bull ({i-1}{unit})" if i > 1 else "▲ Bull (latest)"
                 cross_dir, cross_age = "bull", i - 1
                 break
             if cross_down.iloc[idx]:
-                cross_label = f"▼ Bear ({i-1}d)" if i > 1 else "▼ Bear (today)"
+                cross_label = f"▼ Bear ({i-1}{unit})" if i > 1 else "▼ Bear (latest)"
                 cross_dir, cross_age = "bear", i - 1
                 break
         # Direction of current SMI vs signal (for colour)
@@ -613,14 +638,25 @@ def rank_by(result, choice):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def run_analysis(symbols):
-    """Download and score everything; cached so filter changes are instant."""
+def load_prices(symbols):
+    """Daily stock and index prices, shared by both timeframes."""
     data = download_ohlcv(list(symbols))
     try:
-        idx_ret_series = index_returns(download_index())
+        index_data = download_index()
+    except Exception:
+        index_data = None
+    return data, index_data
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def run_analysis(symbols, timeframe="Daily"):
+    """Score everything on one timeframe; cached so filter changes are instant."""
+    data, index_data = load_prices(symbols)
+    try:
+        idx_ret_series = index_returns(index_data, timeframe)
     except Exception:
         idx_ret_series = None
-    result, skipped = analyse_all(data, symbols, idx_ret_series)
+    result, skipped = analyse_all(data, symbols, idx_ret_series, timeframe)
     last_bar = None
     if data is not None and not data.empty:
         last_bar = data.index.max().strftime("%Y-%m-%d")
@@ -632,7 +668,7 @@ def run_analysis(symbols):
     return result, skipped, meta
 
 
-def data_freshness(last_bar):
+def data_freshness(last_bar, timeframe="Daily"):
     """Compare the latest bar with the last session that should have closed.
 
     Returns (level, message); level is "ok", "partial" or "stale". Weekdays
@@ -651,6 +687,10 @@ def data_freshness(last_bar):
     if bar > expected:
         return "partial", f"Data as of {label} — intraday, today's bar is not final"
     lag = int(np.busday_count(bar, expected))
+    week_end = bar + timedelta(days=4 - bar.weekday())
+    if timeframe == "Weekly" and lag == 0 and bar < week_end and today <= week_end:
+        return "partial", (f"Data as of {label} close — this week's bar is still forming "
+                           f"(week to {week_end.strftime('%a %d %b')})")
     if lag == 0:
         return "ok", f"Data as of {label} close"
     return "stale", (f"Data as of {label} — {lag} trading day{'s' if lag > 1 else ''} "
@@ -733,6 +773,13 @@ def main():
         if st.button("Refresh Data", width="stretch"):
             st.cache_data.clear()
 
+        timeframe = st.radio(
+            "Timeframe", list(TIMEFRAMES), index=0, horizontal=True,
+            help="Bars the indicators and score use. 12-1 Return and the "
+                 "52-week high/low are always from daily data.",
+        )
+        unit = TIMEFRAMES[timeframe]
+
         st.markdown("---")
         rank_choice = st.radio(
             "Rank by", list(RANK_KEYS), index=0,
@@ -748,11 +795,8 @@ def main():
             ["Strong Long", "Long", "Neutral", "Short", "Strong Short"],
             default=[],
         )
-        smi_cross_filter = st.radio(
-            "SMI Crossover",
-            ["All", "Recent Bull Cross (≤3d)", "Recent Bear Cross (≤3d)"],
-            index=0,
-        )
+        cross_options = ["All", f"Recent Bull Cross (≤3{unit})", f"Recent Bear Cross (≤3{unit})"]
+        smi_cross_filter = st.radio("SMI Crossover", cross_options, index=0)
         zone_filter = st.multiselect(
             "RSI Zone",
             ["Strong Bull", "Bullish", "Neutral", "Bearish", "Strong Bear"],
@@ -799,14 +843,14 @@ def main():
 
     with st.spinner(f"Downloading and scoring {len(symbols)} stocks..."):
         try:
-            result, skipped, meta = run_analysis(tuple(symbols))
+            result, skipped, meta = run_analysis(tuple(symbols), timeframe)
         except Exception as e:
             st.error(f"Price download failed: {e}")
             st.stop()
 
-    level, fresh_msg = data_freshness(meta["last_bar"])
+    level, fresh_msg = data_freshness(meta["last_bar"], timeframe)
     {"ok": st.success, "partial": st.info, "stale": st.warning}[level](
-        f"{fresh_msg} · scanned {meta['scan_time']}", icon="📅")
+        f"{timeframe} bars · {fresh_msg} · scanned {meta['scan_time']}", icon="📅")
 
     if not meta["index_ok"]:
         st.sidebar.warning("Index data unavailable — RS will use 0 baseline")
@@ -826,8 +870,7 @@ def main():
     filtered = result.copy()
     if signal_filter:
         filtered = filtered[filtered["Signal"].isin(signal_filter)]
-    cross_dir = {"Recent Bull Cross (≤3d)": "bull",
-                 "Recent Bear Cross (≤3d)": "bear"}.get(smi_cross_filter)
+    cross_dir = {cross_options[1]: "bull", cross_options[2]: "bear"}.get(smi_cross_filter)
     if cross_dir:
         filtered = filtered[(filtered["_cross_dir"] == cross_dir)
                             & (filtered["_cross_age"] <= 3)]
@@ -930,25 +973,25 @@ def main():
 
         col_config = {
             "Score Trend": st.column_config.LineChartColumn(
-                "Score 7D", width="small", y_min=-100, y_max=100,
+                f"Score 7{unit.upper()}", width="small", y_min=-100, y_max=100,
             ),
             "RSI Trend": st.column_config.LineChartColumn(
-                "RSI 7D", width="small", y_min=0, y_max=100,
+                f"RSI 7{unit.upper()}", width="small", y_min=0, y_max=100,
             ),
             "SMI Trend": st.column_config.LineChartColumn(
-                "SMI 7D", width="small", y_min=-80, y_max=80,
+                f"SMI 7{unit.upper()}", width="small", y_min=-80, y_max=80,
             ),
             "ADX Trend": st.column_config.LineChartColumn(
-                "ADX 7D", width="small", y_min=0, y_max=60,
+                f"ADX 7{unit.upper()}", width="small", y_min=0, y_max=60,
             ),
             "EMA Trend": st.column_config.LineChartColumn(
-                "EMA 7D", width="small", y_min=-100, y_max=100,
+                f"EMA 7{unit.upper()}", width="small", y_min=-100, y_max=100,
             ),
             "RS Trend": st.column_config.LineChartColumn(
-                "RS 7D", width="small", y_min=-100, y_max=100,
+                f"RS 7{unit.upper()}", width="small", y_min=-100, y_max=100,
             ),
             "OBV Trend": st.column_config.LineChartColumn(
-                "OBV 7D", width="small", y_min=-100, y_max=100,
+                f"OBV 7{unit.upper()}", width="small", y_min=-100, y_max=100,
             ),
             "Score": st.column_config.NumberColumn(format="%.1f"),
             "12-1 %": st.column_config.NumberColumn(
