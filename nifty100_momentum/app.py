@@ -950,7 +950,9 @@ def main():
             .map(color_smi_cross, subset=["SMI Cross"]) \
             .map(color_trend_dir, subset=["Score Dir", "RSI Dir", "SMI Dir", "ADX Dir", "EMA Dir", "RS Dir", "OBV Dir"])
 
-        st.dataframe(styled, width="stretch", height=800)
+        # Keyed by timeframe so switching remounts the grid; reusing it kept
+        # the previous table's cell colours on the new rows
+        st.dataframe(styled, width="stretch", height=800, key=f"compact_{timeframe}")
 
     else:
         # Full dashboard with sparkline trends
